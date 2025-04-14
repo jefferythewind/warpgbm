@@ -140,7 +140,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     def find_best_split_v2(self, G, H):
         eps = 1e-6
         lambda_l2 = 0.0
-        lambda_l1 = 1.0  # Now included like you asked
         F, B = G.shape
 
         G_total = torch.sum(G, dim=1, keepdim=True)
@@ -154,23 +153,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         H_L = torch.clamp(H_L, min=eps)
         H_R = torch.clamp(H_R, min=eps)
 
-        def calc_gain(GX, HX):
-            abs_GX = torch.abs(GX)
-            penalty = lambda_l1
-            mask = (abs_GX > penalty).float()
-            sign_GX = torch.sign(GX)
-            shrinked = sign_GX * (abs_GX - penalty) * mask
-            return (shrinked ** 2) / (HX + lambda_l2)
-
-        gain_L = calc_gain(G_L, H_L)
-        gain_R = calc_gain(G_R, H_R)
-        gain = gain_L + gain_R
-
+        gain = (G_L ** 2) / (H_L + lambda_l2) + (G_R ** 2) / (H_R + lambda_l2)
         best_gain = torch.max(gain)
         best_flat_idx = torch.argmax(gain)
         best_feat = best_flat_idx // (B - 1)
         best_bin = best_flat_idx % (B - 1)
-
         return int(best_feat), int(best_bin)
     
     def grow_tree(self, gradient_histogram, hessian_histogram, node_indices, depth):
