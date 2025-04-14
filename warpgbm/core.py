@@ -20,11 +20,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         min_child_weight=20,
         min_split_gain=0.0,
         verbosity=True,
-        histogram_computer='hist1',
-        threads_per_block=256,
-        rows_per_thread=1,
+        histogram_computer='hist3',
+        threads_per_block=32,
+        rows_per_thread=4,
         device = 'cuda',
-        split_type = 'v1',
+        split_type = 'v2',
+        L2_reg = 0.000001,
     ):
         self.num_bins = num_bins
         self.max_depth = max_depth
@@ -54,6 +55,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.threads_per_block = threads_per_block
         self.rows_per_thread = rows_per_thread
         self.split_type = split_type
+        self.L2_reg = L2_reg
 
 
     def fit(self, X, y, era_id=None):
@@ -126,9 +128,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             hessian_histogram.contiguous(),
             self.num_features,
             self.num_bins,
-            0.0,  # L2 reg
-            1.0,  # L1 reg
-            1e-6, # hess cap
+            self.min_split_gain,  # 
+            self.min_child_weight,  #
+            self.L2_reg, # eps
             self.out_feature,
             self.out_bin
         )
@@ -138,8 +140,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return (f, b)
     
     def find_best_split_v2(self, G, H):
-        eps = 1e-6
-        lambda_l2 = 0.0
         F, B = G.shape
 
         G_total = torch.sum(G, dim=1, keepdim=True)
@@ -150,12 +150,19 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         G_R = G_total - G_L
         H_R = H_total - H_L
 
-        H_L = torch.clamp(H_L, min=eps)
-        H_R = torch.clamp(H_R, min=eps)
+        gain = (G_L ** 2) / (H_L + self.L2_reg) + (G_R ** 2) / (H_R + self.L2_reg)
+        invalid_mask = (H_L < self.min_child_weight) | (H_R < self.min_child_weight) | (gain < self.min_split_gain)
 
-        gain = (G_L ** 2) / (H_L + lambda_l2) + (G_R ** 2) / (H_R + lambda_l2)
-        best_gain = torch.max(gain)
+        # Mask invalid gains
+        gain[invalid_mask] = -float('inf')
+
+        # Find the best valid split
         best_flat_idx = torch.argmax(gain)
+        best_gain = gain.view(-1)[best_flat_idx]
+
+        if best_gain == -float('inf'):  # No valid splits
+            return -1, -1
+
         best_feat = best_flat_idx // (B - 1)
         best_bin = best_flat_idx % (B - 1)
         return int(best_feat), int(best_bin)
