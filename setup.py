@@ -40,14 +40,29 @@ def get_extensions():
 
 setup(
     name="warpgbm",
-    version="0.1.4",
+    version="0.1.5",  # bump version to avoid reuse error
+    description="Warp-speed GBDT with CUDA histogram acceleration",
+    long_description="High-performance gradient boosted decision trees with GPU acceleration.",
+    long_description_content_type="text/markdown",
+    author="Pranshu Bahadur",
+    license="GPL-3.0-only",
+    classifiers=[
+        "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Operating System :: OS Independent",
+    ],
     packages=find_packages(),
     ext_modules=get_extensions(),
-    cmdclass={"build_ext": BuildExtension} if CUDA_HOME is not None else {},
+    cmdclass={"build_ext": BuildExtension} if CUDA_HOME else {},
     install_requires=[
         "torch",
         "numpy",
         "scikit-learn",
         "tqdm",
     ],
+    include_package_data=True,
+    zip_safe=False,
 )
