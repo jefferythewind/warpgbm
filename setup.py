@@ -40,7 +40,7 @@ def get_extensions():
 
 setup(
     name="warpgbm",
-    version="0.1.3",
+    version="0.1.4",
     packages=find_packages(),
     ext_modules=get_extensions(),
     cmdclass={"build_ext": BuildExtension} if CUDA_HOME is not None else {},
