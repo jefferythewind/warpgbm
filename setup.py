@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
@@ -37,8 +38,9 @@ def get_extensions():
         )
     ]
 
-# Get version
-with open("version.txt") as f:
+# Get version reliably (works in CI too)
+here = Path(__file__).resolve().parent
+with open(here / "version.txt") as f:
     version = f.read().strip()
 
 setup(
