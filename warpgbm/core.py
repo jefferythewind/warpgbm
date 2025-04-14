@@ -23,7 +23,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         histogram_computer='hist1',
         threads_per_block=256,
         rows_per_thread=1,
-        device = 'cuda'
+        device = 'cuda',
+        split_type = 'v1',
     ):
         self.num_bins = num_bins
         self.max_depth = max_depth
@@ -52,6 +53,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.compute_histogram = histogram_kernels[histogram_computer]
         self.threads_per_block = threads_per_block
         self.rows_per_thread = rows_per_thread
+        self.split_type = split_type
 
 
     def fit(self, X, y, era_id=None):
@@ -135,6 +137,42 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         b = int(self.out_bin[0])
         return (f, b)
     
+    def find_best_split_v2(self, G, H):
+        eps = 1e-6
+        lambda_l2 = 0.0
+        lambda_l1 = 1.0  # Now included like you asked
+        F, B = G.shape
+
+        G_total = torch.sum(G, dim=1, keepdim=True)
+        H_total = torch.sum(H, dim=1, keepdim=True)
+
+        G_L = torch.cumsum(G, dim=1)[:, :-1]
+        H_L = torch.cumsum(H, dim=1)[:, :-1]
+        G_R = G_total - G_L
+        H_R = H_total - H_L
+
+        H_L = torch.clamp(H_L, min=eps)
+        H_R = torch.clamp(H_R, min=eps)
+
+        def calc_gain(GX, HX):
+            abs_GX = torch.abs(GX)
+            penalty = lambda_l1
+            mask = (abs_GX > penalty).float()
+            sign_GX = torch.sign(GX)
+            shrinked = sign_GX * (abs_GX - penalty) * mask
+            return (shrinked ** 2) / (HX + lambda_l2)
+
+        gain_L = calc_gain(G_L, H_L)
+        gain_R = calc_gain(G_R, H_R)
+        gain = gain_L + gain_R
+
+        best_gain = torch.max(gain)
+        best_flat_idx = torch.argmax(gain)
+        best_feat = best_flat_idx // (B - 1)
+        best_bin = best_flat_idx % (B - 1)
+
+        return int(best_feat), int(best_bin)
+    
     def grow_tree(self, gradient_histogram, hessian_histogram, node_indices, depth):
         if depth == self.max_depth:
             leaf_value = self.residual[node_indices].mean()
@@ -142,7 +180,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return {"leaf_value": leaf_value.item(), "samples": node_indices.numel()}
     
         parent_size = node_indices.numel()
-        best_feature, best_bin = self.find_best_split(gradient_histogram, hessian_histogram)
+        if self.split_type == 'v1':
+            best_feature, best_bin = self.find_best_split(gradient_histogram, hessian_histogram)
+        elif self.split_type == 'v2':
+            best_feature, best_bin = self.find_best_split_v2(gradient_histogram, hessian_histogram)
     
         if best_feature == -1:
             leaf_value = self.residual[node_indices].mean()
