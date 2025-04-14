@@ -38,14 +38,9 @@ def get_extensions():
         )
     ]
 
-# Get version reliably (works in CI too)
-here = Path(__file__).resolve().parent
-with open(here / "version.txt") as f:
-    version = f.read().strip()
-
 setup(
     name="warpgbm",
-    version=version,
+    version="0.1.3",
     packages=find_packages(),
     ext_modules=get_extensions(),
     cmdclass={"build_ext": BuildExtension} if CUDA_HOME is not None else {},
