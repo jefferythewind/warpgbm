@@ -9,8 +9,8 @@ from sklearn.datasets import make_regression
 
 def test_fit_predictpytee_correlation():
     np.random.seed(42)
-    N = 5000
-    F = 6
+    N = 100_000
+    F = 1000
     X, y = make_regression(n_samples=N, n_features=F, noise=0.1, random_state=42)
     era = np.zeros(N, dtype=np.int32)
     corrs = []
@@ -20,7 +20,7 @@ def test_fit_predictpytee_correlation():
 
         model = WarpGBM(
             max_depth=10,
-            num_bins=4,
+            num_bins=10,
             n_estimators=10,
             learning_rate=1,
             verbosity=False,
