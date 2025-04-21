@@ -262,3 +262,217 @@ void launch_histogram_kernel_cuda_configurable(
         printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
     }
 }
+
+__global__ void fused_histogram_split_kernel(
+    const int8_t *__restrict__ bin_indices, // [N, F]
+    const float *__restrict__ gradients,    // [N]
+    const float *__restrict__ parent_grad,  // [F * B]
+    const float *__restrict__ parent_hess,  // [F * B]
+    float *__restrict__ grad_hist,          // [F * B]
+    float *__restrict__ hess_hist,          // [F * B]
+    float *__restrict__ best_gain_first,    // [F]
+    int *__restrict__ best_bin_first,       // [F]
+    float *__restrict__ best_gain_second,   // [F]
+    int *__restrict__ best_bin_second,      // [F]
+    int64_t N, int64_t F, int64_t B,
+    float min_child_weight,
+    float min_split_gain,
+    float eps,
+    int rows_per_thread)
+{
+    int feat = blockIdx.x;
+    int tid = threadIdx.x;
+    int row_start = (blockIdx.y * blockDim.x + tid) * rows_per_thread;
+
+    extern __shared__ float shmem[];
+    float *final_grad = shmem;     // [B]
+    float *final_hess = &shmem[B]; // [B]
+
+    for (int b = tid; b < B; b += blockDim.x)
+    {
+        final_grad[b] = 0.0f;
+        final_hess[b] = 0.0f;
+    }
+    __syncthreads();
+
+    // Accumulate local histogram
+    for (int r = 0; r < rows_per_thread; ++r)
+    {
+        int row = row_start + r;
+        if (row < N)
+        {
+            int8_t bin = bin_indices[row * F + feat];
+            if (bin >= 0 && bin < B)
+            {
+                atomicAdd(&final_grad[bin], gradients[row]);
+                atomicAdd(&final_hess[bin], 1.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int b = tid; b < B; b += blockDim.x)
+    {
+        int64_t idx = feat * B + b;
+        atomicAdd(&grad_hist[idx], final_grad[b]);
+        atomicAdd(&hess_hist[idx], final_hess[b]);
+    }
+    __syncthreads();
+
+    // Only thread 0 of each block may proceed to check the global state
+    if (tid < 2)
+    {
+        float global_hess_sum = 0.0f;
+        for (int b = 0; b < B; ++b)
+        {
+            global_hess_sum += hess_hist[feat * B + b];
+        }
+
+        if (fabsf(global_hess_sum - static_cast<float>(N)) > eps)
+        {
+            // printf("❗Feature %d: global_hess_sum = %.1f vs N = %lld → SKIP\n", feat, global_hess_sum, N);
+            return; // Don't proceed until histogram is fully accumulated
+        }
+
+        float local_grad[128] = {0};
+        float local_hess[128] = {0};
+
+        for (int b = 0; b < B; ++b)
+        {
+            float g_hist = grad_hist[feat * B + b];
+            float h_hist = hess_hist[feat * B + b];
+            float g_parent = parent_grad[feat * B + b];
+            float h_parent = parent_hess[feat * B + b];
+
+            // For tid == 0: compute left child (histogram data)
+            // For tid == 1: compute right child (parent - histogram)
+            if (tid == 0)
+            {
+                local_grad[b] = g_hist;
+                local_hess[b] = h_hist;
+            }
+            else
+            {
+                local_grad[b] = g_parent - g_hist;
+                local_hess[b] = h_parent - h_hist;
+            }
+        }
+
+        float G_total = 0.0f, H_total = 0.0f;
+        for (int b = 0; b < B; ++b)
+        {
+            G_total += local_grad[b];
+            H_total += local_hess[b];
+        }
+
+        float G_L = 0.0f, H_L = 0.0f;
+        float best_gain = min_split_gain;
+        int best_bin = -1;
+
+        for (int b = 0; b < B - 1; ++b)
+        {
+            G_L += local_grad[b];
+            H_L += local_hess[b];
+            float G_R = G_total - G_L;
+            float H_R = H_total - H_L;
+
+            // if (H_L < min_child_weight || H_R < min_child_weight)
+            //     printf("Feature %d Bin %d: H_L = %.2f, H_R = %.2f — Skipped due to min_child_weight\n", feat, b, H_L, H_R);
+            // else
+            //     printf("Feature %d Bin %d: H_L = %.2f, H_R = %.2f — gain = %.5f\n", feat, b, H_L, H_R, (G_L * G_L) / (H_L + eps) + (G_R * G_R) / (H_R + eps) - (G_total * G_total) / (H_total + eps));
+
+            if (H_L >= min_child_weight && H_R >= min_child_weight)
+            {
+                float gain = (G_L * G_L) / (H_L + eps) + (G_R * G_R) / (H_R + eps) - (G_total * G_total) / (H_total + eps);
+                if (gain > best_gain)
+                {
+                    best_gain = gain;
+                    best_bin = b;
+                }
+            }
+        }
+
+        // printf("Feature %d (tid=%d): Best bin = %d, gain = %.5f\n", feat, tid, best_bin, best_gain);
+        if (tid == 0)
+        {
+            best_gain_first[feat] = best_gain;
+            best_bin_first[feat] = best_bin;
+        }
+        else if (tid == 1)
+        {
+            best_gain_second[feat] = best_gain;
+            best_bin_second[feat] = best_bin;
+        }
+    }
+}
+
+void launch_fused_histogram_split_kernel(
+    const at::Tensor &bin_indices,
+    const at::Tensor &gradients,
+    const at::Tensor &parent_grad,
+    const at::Tensor &parent_hess,
+    at::Tensor &grad_hist,
+    at::Tensor &hess_hist,
+    at::Tensor &best_gain_first,
+    at::Tensor &best_bin_first,
+    at::Tensor &best_gain_second,
+    at::Tensor &best_bin_second,
+    int num_bins,
+    float min_child_weight,
+    float min_split_gain,
+    float eps,
+    int threads_per_block = 256,
+    int rows_per_thread = 1)
+{
+    CHECK_INPUT(bin_indices);
+    CHECK_INPUT(gradients);
+    CHECK_INPUT(parent_grad);
+    CHECK_INPUT(parent_hess);
+    CHECK_INPUT(grad_hist);
+    CHECK_INPUT(hess_hist);
+    CHECK_INPUT(best_gain_first);
+    CHECK_INPUT(best_bin_first);
+    CHECK_INPUT(best_gain_second);
+    CHECK_INPUT(best_bin_second);
+
+    int64_t N = bin_indices.size(0);
+    int64_t F = bin_indices.size(1);
+
+    // if (N == 0)
+    // {
+    //     std::cerr << "[WarpGBM Fused Kernel Warning] Launch skipped because N == 0 (no rows to process).\n";
+    //     std::cerr << "  bin_indices.size(0): " << N << ", bin_indices.size(1): " << F << std::endl;
+    //     std::cerr << "  This should not happen. Investigate upstream logic.\n";
+    //     return;
+    // }
+
+    int rows_per_block = threads_per_block * rows_per_thread;
+    int row_tiles = (N + rows_per_block - 1) / rows_per_block;
+
+    dim3 blocks(F, row_tiles);
+    dim3 threads(threads_per_block);
+    int shared_mem_bytes = 2 * num_bins * sizeof(float);
+
+    // std::cout << "Launching fused kernel with config:" << std::endl;
+    // std::cout << "  Threads per block: " << threads_per_block << std::endl;
+    // std::cout << "  Rows per thread: " << rows_per_thread << std::endl;
+    // std::cout << "  Grid: (" << F << ", " << row_tiles << ")" << std::endl;
+    // std::cout << "  Shared memory: " << 2 * num_bins * sizeof(float) << " bytes" << std::endl;
+
+    fused_histogram_split_kernel<<<blocks, threads, shared_mem_bytes>>>(
+        bin_indices.data_ptr<int8_t>(),
+        gradients.data_ptr<float>(),
+        parent_grad.data_ptr<float>(),
+        parent_hess.data_ptr<float>(),
+        grad_hist.data_ptr<float>(),
+        hess_hist.data_ptr<float>(),
+        best_gain_first.data_ptr<float>(),
+        best_bin_first.data_ptr<int>(),
+        best_gain_second.data_ptr<float>(),
+        best_bin_second.data_ptr<int>(),
+        N, F, num_bins,
+        min_child_weight,
+        min_split_gain,
+        eps,
+        rows_per_thread);
+}

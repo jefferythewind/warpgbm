@@ -118,8 +118,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.root_node_indices = torch.arange(self.num_samples, device=self.device)
         self.base_prediction = self.Y_gpu.mean().item()
         self.gradients += self.base_prediction
-        self.best_gains = torch.zeros(self.num_features, device=self.device)
-        self.best_bins = torch.zeros(self.num_features, device=self.device, dtype=torch.int32)
+        self.best_gains_first = torch.zeros(self.num_features, device=self.device)
+        self.best_bins_first = torch.zeros(self.num_features, device=self.device, dtype=torch.int32)
+        self.best_gains_second = torch.zeros(self.num_features, device=self.device)
+        self.best_bins_second = torch.zeros(self.num_features, device=self.device, dtype=torch.int32)
+        
         with torch.no_grad():
             self.forest = self.grow_forest()
         return self
@@ -161,106 +164,126 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             unique_eras, era_indices = torch.unique(era_id_gpu, return_inverse=True)
             return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
-
-    def compute_histograms(self, bin_indices_sub, gradients):
-        grad_hist = torch.zeros((self.num_features, self.num_bins), device=self.device, dtype=torch.float32)
-        hess_hist = torch.zeros((self.num_features, self.num_bins), device=self.device, dtype=torch.float32)
     
-        self.compute_histogram(
-            bin_indices_sub,
-            gradients,
-            grad_hist,
-            hess_hist,
-            self.num_bins,
-            self.threads_per_block,
-            self.rows_per_thread
-        )
-        return grad_hist, hess_hist
-
-    def find_best_split(self, gradient_histogram, hessian_histogram):
-        node_kernel.compute_split(
-            gradient_histogram,
-            hessian_histogram,
-            self.min_split_gain,
-            self.min_child_weight,
-            self.L2_reg,
-            self.best_gains,
-            self.best_bins,
-            self.threads_per_block
-        )
-
-        if torch.all(self.best_bins == -1):
-            return -1, -1  # No valid split found
-
-        f = torch.argmax(self.best_gains).item()
-        b = self.best_bins[f].item()
-
-        return f, b
-    
-    def grow_tree(self, gradient_histogram, hessian_histogram, node_indices, depth):
-        if depth == self.max_depth:
-            leaf_value = self.residual[node_indices].mean()
-            self.gradients[node_indices] += self.learning_rate * leaf_value
-            return {"leaf_value": leaf_value.item(), "samples": node_indices.numel()}
-    
-        parent_size = node_indices.numel()
-        best_feature, best_bin = self.find_best_split(gradient_histogram, hessian_histogram)
-    
-        if best_feature == -1:
-            leaf_value = self.residual[node_indices].mean()
-            self.gradients[node_indices] += self.learning_rate * leaf_value
-            return {"leaf_value": leaf_value.item(), "samples": parent_size}
-    
-        split_mask = (self.bin_indices[node_indices, best_feature] <= best_bin)
-        left_indices = node_indices[split_mask]
-        right_indices = node_indices[~split_mask]
-
-        left_size = left_indices.numel()
-        right_size = right_indices.numel()
-
-        if left_size == 0 or right_size == 0:
-            leaf_value = self.residual[node_indices].mean()
-            self.gradients[node_indices] += self.learning_rate * leaf_value
-            return {"leaf_value": leaf_value.item(), "samples": parent_size}
-
-        if left_size <= right_size:
-            grad_hist_left, hess_hist_left = self.compute_histograms( self.bin_indices[left_indices], self.residual[left_indices] )
-            grad_hist_right = gradient_histogram - grad_hist_left
-            hess_hist_right = hessian_histogram - hess_hist_left
-        else:
-            grad_hist_right, hess_hist_right = self.compute_histograms( self.bin_indices[right_indices], self.residual[right_indices] )
-            grad_hist_left = gradient_histogram - grad_hist_right
-            hess_hist_left = hessian_histogram - hess_hist_right
-
-        new_depth = depth + 1
-        left_child = self.grow_tree(grad_hist_left, hess_hist_left, left_indices, new_depth)
-        right_child = self.grow_tree(grad_hist_right, hess_hist_right, right_indices, new_depth)
-    
-        return { "feature": best_feature, "bin": best_bin, "left": left_child, "right": right_child }
-
     def grow_forest(self):
         forest = [{} for _ in range(self.n_estimators)]
         self.training_loss = []
-    
-        for i in tqdm( range(self.n_estimators) ):
+
+        for i in tqdm(range(self.n_estimators)):
             self.residual = self.Y_gpu - self.gradients
-    
-            self.root_gradient_histogram, self.root_hessian_histogram = \
-                self.compute_histograms(self.bin_indices, self.residual)
-    
-            tree = self.grow_tree(
-                self.root_gradient_histogram,
-                self.root_hessian_histogram,
-                self.root_node_indices,
-                depth=0
+
+            # Initialize dummy parent histogram for root
+            parent_grad = torch.zeros((self.num_features, self.num_bins), device=self.device)
+            parent_hess = torch.zeros((self.num_features, self.num_bins), device=self.device)
+            grad_hist = torch.zeros((self.num_features, self.num_bins), device=self.device)
+            hess_hist = torch.zeros((self.num_features, self.num_bins), device=self.device)
+
+            # print( "parent grad: ", parent_grad )
+            node_kernel.compute_fused_histogram_split(
+                self.bin_indices,
+                self.residual,
+                parent_grad,
+                parent_hess,
+                grad_hist,
+                hess_hist,
+                self.best_gains_first,
+                self.best_bins_first,
+                self.best_gains_second,
+                self.best_bins_second,
+                self.num_bins,
+                self.min_child_weight,
+                self.min_split_gain,
+                self.L2_reg,
+                self.threads_per_block,
+                self.rows_per_thread
             )
+
+            best_feature = torch.argmax(self.best_gains_first).item()
+            best_bin = self.best_bins_first[best_feature].item()
+
+            tree = self.grow_tree(grad_hist, hess_hist, self.root_node_indices, best_feature, best_bin, depth=0)
             forest[i] = tree
-        # loss = ((self.Y_gpu - self.gradients) ** 2).mean().item()
-        # self.training_loss.append(loss)
-        # print(f"🌲 Tree {i+1}/{self.n_estimators} - MSE: {loss:.6f}")
 
         print("Finished training forest.")
         return forest
+
+    def grow_tree(self, parent_grad_hist, parent_hess_hist, node_indices, split_feature, split_bin, depth):
+        if depth == self.max_depth or split_bin == -1:
+            leaf_value = self.residual[node_indices].mean()
+            self.gradients[node_indices] += self.learning_rate * leaf_value
+            return {"leaf_value": leaf_value.item(), "samples": node_indices.numel()}
+
+        split_mask = (self.bin_indices[node_indices, split_feature] <= split_bin)
+        left_indices = node_indices[split_mask]
+        right_indices = node_indices[~split_mask]
+        # print("left node size: ",len(left_indices), " right size: ", len(right_indices), "split feaature:", split_feature, " bin: ", split_bin)
+
+        # Determine smaller node
+        if left_indices.numel() <= right_indices.numel():
+            target_indices = left_indices
+            first_is_left = True
+        else:
+            target_indices = right_indices
+            first_is_left = False
+
+        grad_hist = torch.zeros((self.num_features, self.num_bins), device=self.device)
+        hess_hist = torch.zeros((self.num_features, self.num_bins), device=self.device)
+
+        self.best_gains_first.fill_(-float("inf"))
+        self.best_bins_first.fill_(-1)
+        self.best_gains_second.fill_(-float("inf"))
+        self.best_bins_second.fill_(-1)
+
+        node_kernel.compute_fused_histogram_split(
+            self.bin_indices[target_indices],
+            self.residual[target_indices],
+            parent_grad_hist,
+            parent_hess_hist,
+            grad_hist,
+            hess_hist,
+            self.best_gains_first,
+            self.best_bins_first,
+            self.best_gains_second,
+            self.best_bins_second,
+            self.num_bins,
+            self.min_child_weight,
+            self.min_split_gain,
+            self.L2_reg,
+            self.threads_per_block,
+            self.rows_per_thread
+        )
+
+        argmax_first = torch.argmax(self.best_gains_first)
+        argmax_second = torch.argmax(self.best_gains_second)
+        # print("argmax_first: ", argmax_first.item(), " argmax_second: ", argmax_second.item())
+        # print("1best gains:", self.best_gains_first)
+        # print( "1best bins: ", self.best_bins_first)
+        # print("2best gains:", self.best_gains_second)
+        # print( "2best bins: ", self.best_bins_second)
+
+        new_depth = depth + 1
+        if first_is_left:
+            left_split = (argmax_first.item(), self.best_bins_first[argmax_first].item())
+            right_split = (argmax_second.item(), self.best_bins_second[argmax_second].item())
+            right_grad = parent_grad_hist - grad_hist
+            right_hess = parent_hess_hist - hess_hist
+            # print("1 left split: ", left_split, " right split: ", right_split)
+            # print("right grad: ", right_grad)
+            # print("right hess: ", right_hess)
+            left_child = self.grow_tree(grad_hist, hess_hist, left_indices, *left_split, new_depth)
+            right_child = self.grow_tree(right_grad, right_hess, right_indices, *right_split, new_depth)
+        else:
+            right_split = (argmax_first.item(), self.best_bins_first[argmax_first].item())
+            left_split = (argmax_second.item(), self.best_bins_second[argmax_second].item())
+            left_grad = parent_grad_hist - grad_hist
+            left_hess = parent_hess_hist - hess_hist
+            # print("2 left split: ", left_split, " right split: ", right_split)
+            right_child = self.grow_tree(grad_hist, hess_hist, right_indices, *right_split, new_depth)
+            left_child = self.grow_tree(left_grad, left_hess, left_indices, *left_split, new_depth)
+        
+        # print('---')
+
+        return {"feature": split_feature, "bin": split_bin, "left": left_child, "right": right_child}
 
     def predict(self, X_np, chunk_size=50000):
         """
