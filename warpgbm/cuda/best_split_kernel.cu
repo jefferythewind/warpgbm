@@ -2,27 +2,33 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-__global__ void best_split_kernel_global_only(
-    const float *__restrict__ G, // [F x B]
-    const float *__restrict__ H, // [F x B]
-    int F,
-    int B,
+__global__ void best_split_kernel_levelwise(
+    const float *__restrict__ G, // [N x F x B] flattened
+    const float *__restrict__ H,
+    const int *__restrict__ node_ids, // [N], maps kernel-local node index -> global node index
+    int N, int F, int B,
     float min_split_gain,
     float min_child_samples,
     float eps,
-    float *__restrict__ best_gains, // [F]
-    int *__restrict__ best_bins     // [F]
+    float *__restrict__ split_gains, // [global_nodes x F]
+    int *__restrict__ split_bins     // [global_nodes x F]
 )
 {
-    int f = blockIdx.x * blockDim.x + threadIdx.x;
-    if (f >= F)
+    int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_id >= N * F)
         return;
+
+    int local_n = global_id / F;
+    int f = global_id % F;
+    int n = node_ids[local_n]; // actual global node id
+
+    int base_idx = local_n * F * B + f * B; // indexing into local G/H
 
     float G_total = 0.0f, H_total = 0.0f;
     for (int b = 0; b < B; ++b)
     {
-        G_total += G[f * B + b];
-        H_total += H[f * B + b];
+        G_total += G[base_idx + b];
+        H_total += H[base_idx + b];
     }
 
     float G_L = 0.0f, H_L = 0.0f;
@@ -31,8 +37,8 @@ __global__ void best_split_kernel_global_only(
 
     for (int b = 0; b < B - 1; ++b)
     {
-        G_L += G[f * B + b];
-        H_L += H[f * B + b];
+        G_L += G[base_idx + b];
+        H_L += H[base_idx + b];
         float G_R = G_total - G_L;
         float H_R = H_total - H_L;
 
@@ -47,33 +53,46 @@ __global__ void best_split_kernel_global_only(
         }
     }
 
-    best_gains[f] = best_gain;
-    best_bins[f] = best_bin;
+    int out_idx = n * F + f;
+    split_gains[out_idx] = best_gain;
+    split_bins[out_idx] = best_bin;
 }
 
-void launch_best_split_kernel_cuda(
-    const at::Tensor &G, // [F x B]
-    const at::Tensor &H, // [F x B]
+void find_splits_for_level(
+    const at::Tensor &node_ids, // [N] global node ids
+    const at::Tensor &G,        // [N x F x B]
+    const at::Tensor &H,        // [N x F x B]
     float min_split_gain,
     float min_child_samples,
     float eps,
-    at::Tensor &best_gains, // [F], float32
-    at::Tensor &best_bins,  // [F], int32
-    int threads)
+    at::Tensor &split_gains, // [max_nodes x F]
+    at::Tensor &split_bins,  // [max_nodes x F]
+    int threads_per_block = 256)
 {
-    int F = G.size(0);
-    int B = G.size(1);
+    int N = node_ids.size(0); // FIXED: use node_ids length, not G.size(0)
+    int F = G.size(1);
+    int B = G.size(2);
 
-    int blocks = (F + threads - 1) / threads;
+    int total_jobs = N * F;
+    int blocks = (total_jobs + threads_per_block - 1) / threads_per_block;
 
-    best_split_kernel_global_only<<<blocks, threads>>>(
+    dim3 grid(blocks);
+    dim3 threads(threads_per_block);
+
+    best_split_kernel_levelwise<<<grid, threads>>>(
         G.data_ptr<float>(),
         H.data_ptr<float>(),
-        F,
-        B,
+        node_ids.data_ptr<int>(),
+        N, F, B,
         min_split_gain,
         min_child_samples,
         eps,
-        best_gains.data_ptr<float>(),
-        best_bins.data_ptr<int>());
+        split_gains.data_ptr<float>(),
+        split_bins.data_ptr<int>());
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        printf("CUDA split kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }

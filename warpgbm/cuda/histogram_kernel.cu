@@ -262,3 +262,80 @@ void launch_histogram_kernel_cuda_configurable(
         printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
     }
 }
+
+__global__ void histogram_kernel(
+    const int8_t *__restrict__ bin_indices,     // [M, F]
+    const float *__restrict__ gradients,        // [M]
+    const int32_t *__restrict__ sample_to_node, // [M]
+    float *__restrict__ grad_hist,              // [max_nodes * F * B]
+    float *__restrict__ hess_hist,              // [max_nodes * F * B]
+    int64_t M, int64_t F, int64_t B,
+    int rows_per_thread)
+{
+    int feat = blockIdx.x; // 1 block per feature
+    int row_start = (blockIdx.y * blockDim.x + threadIdx.x) * rows_per_thread;
+
+    extern __shared__ float shmem[];
+    float *sh_grad = shmem;       // [B]
+    float *sh_hess = &sh_grad[B]; // [B]
+
+    for (int b = threadIdx.x; b < B; b += blockDim.x)
+    {
+        sh_grad[b] = 0.0f;
+        sh_hess[b] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int r = 0; r < rows_per_thread; ++r)
+    {
+        int row = row_start + r;
+        if (row < M)
+        {
+            int node_id = sample_to_node[row];
+            int8_t bin = bin_indices[row * F + feat];
+            if (bin >= 0 && bin < B)
+            {
+                int64_t idx = node_id * F * B + feat * B + bin;
+                atomicAdd(&grad_hist[idx], gradients[row]);
+                atomicAdd(&hess_hist[idx], 1.0f);
+            }
+        }
+    }
+    __syncthreads();
+}
+
+void build_histograms(
+    const at::Tensor &bin_indices,
+    const at::Tensor &sample_to_node,
+    const at::Tensor &residual,
+    at::Tensor &grad_hist,
+    at::Tensor &hess_hist,
+    int threads_per_block = 64,
+    int rows_per_thread = 4)
+{
+    TORCH_CHECK(bin_indices.dim() == 2, "bin_indices must be 2D");
+    int64_t M = bin_indices.size(0); // number of samples
+    int64_t F = bin_indices.size(1);
+    int B = grad_hist.size(2);
+
+    int rows_per_block = threads_per_block * rows_per_thread;
+    int row_tiles = (M + rows_per_block - 1) / rows_per_block;
+
+    dim3 blocks(F, row_tiles);
+    dim3 threads(threads_per_block);
+    int shared_mem_bytes = 2 * B * sizeof(float);
+
+    histogram_kernel<<<blocks, threads, shared_mem_bytes>>>(
+        bin_indices.data_ptr<int8_t>(),
+        residual.data_ptr<float>(),
+        sample_to_node.data_ptr<int32_t>(),
+        grad_hist.data_ptr<float>(),
+        hess_hist.data_ptr<float>(),
+        M, F, B, rows_per_thread);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+}
