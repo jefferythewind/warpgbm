@@ -20,9 +20,9 @@ def test_fit_predictpytee_correlation():
         num_bins=10,
         n_estimators=10,
         learning_rate=1,
-        verbosity=False,
         threads_per_block=64,
-        rows_per_thread=4
+        rows_per_thread=4,
+        # min_child_weight=4
     )
 
     start_fit = time.time()

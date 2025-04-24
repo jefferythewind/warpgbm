@@ -54,6 +54,13 @@ void find_splits_for_level(
     at::Tensor &split_bins,  // [max_nodes x F]
     int threads_per_block = 256);
 
+void predict_with_forest(
+    const at::Tensor &bin_indices, // [N x F], int8
+    const at::Tensor &tree_tensor, // [T x max_nodes x 6], float32
+    float learning_rate,
+    at::Tensor &out // [N], float32
+);
+
 // Bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -63,4 +70,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");
     m.def("build_histograms", &build_histograms, "Histogram Builder CUDA");
     m.def("find_splits_for_level", &find_splits_for_level, "Split Finder CUDA");
+    m.def("predict_forest", &predict_with_forest, "CUDA Predictions");
 }

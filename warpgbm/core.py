@@ -104,6 +104,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype='int32')
         self.bin_indices, era_indices, self.bin_edges, self.unique_eras, self.Y_gpu = self.preprocess_gpu_data(X, y, era_id)
+        print(self.bin_indices)
         self.num_samples, self.num_features = X.shape
         self.gradients = torch.zeros_like(self.Y_gpu)
         self.root_node_indices = torch.arange(self.num_samples, device=self.device)
@@ -179,8 +180,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             tree_nodes = [{} for _ in range(2 ** (self.max_depth + 1))]
             self.sample_to_node.zero_()
 
-            self.grad_hists[0].zero_()
-            self.hess_hists[0].zero_()
+            self.grad_hists.zero_()
+            self.hess_hists.zero_()
+            self.split_gains.fill_(-float("inf"))
+            self.split_bins.fill_(-1)
+            self.best_split_feature.fill_(-1)
+            self.best_split_bin.fill_(-1)
 
             depth_nodes = [0]
             for depth in range(self.max_depth):
@@ -190,8 +195,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 depth_tensor = torch.tensor(depth_nodes, device=self.device, dtype=torch.int32)
                 half_shape = max(int(depth_tensor.shape[0]/2), 1)
 
-                self.grad_hists[half_shape:num_nodes].zero_()
-                self.hess_hists[half_shape:num_nodes].zero_()
+                if depth > 0:
+                    self.grad_hists[int( num_nodes/2 ):num_nodes].zero_()
+                    self.hess_hists[int( num_nodes/2 ):num_nodes].zero_()
                 self.split_gains[:num_nodes].fill_(-float("inf"))
                 self.split_bins[:num_nodes].fill_(-1)
                 self.best_split_feature[:num_nodes].fill_(-1)
@@ -308,5 +314,52 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return forest
 
     def predict(self, X_np, chunk_size=50000):
-       #TODO
-       return
+        X_tensor = torch.from_numpy(X_np).to(torch.float32).pin_memory()
+        num_samples = X_tensor.size(0)
+        bin_indices = torch.zeros((num_samples, self.num_features), dtype=torch.int8, device=self.device)
+
+        with torch.no_grad():
+            for f in range(self.num_features):
+                # print('binning features')
+                X_f = X_tensor[:, f].to(self.device, non_blocking=True)
+                bin_edges_f = self.bin_edges[f]
+                # print(bin_edges_f)
+                bin_indices_f = bin_indices[:, f].contiguous()
+                # print(X_f)
+                node_kernel.custom_cuda_binner(X_f, bin_edges_f, bin_indices_f)
+                bin_indices[:,f] = bin_indices_f
+        
+        # print(bin_indices)
+
+        tree_tensor = torch.stack([self.flatten_tree(tree, max_nodes=2**(self.max_depth + 1)) for tree in self.forest]).to(self.device)
+
+        # print("tree tensor")
+        # print(tree_tensor)
+
+        out = torch.zeros(num_samples, device=self.device)
+
+        node_kernel.predict_forest(
+            bin_indices.contiguous(),
+            tree_tensor.contiguous(),
+            self.learning_rate,
+            out
+        )
+
+        return out.cpu().numpy()
+
+    def flatten_tree(self, tree, max_nodes):
+        flat = torch.full((max_nodes, 6), float('nan'), dtype=torch.float32)
+        for node in tree:
+            if not node:
+                continue
+            i = node['node_id']
+            if 'leaf_value' in node:
+                flat[i, 4] = 1.0  # leaf flag
+                flat[i, 5] = node['leaf_value'].item()
+            else:
+                flat[i, 0] = node['best_feature']
+                flat[i, 1] = node['split_bin']
+                flat[i, 2] = node['left_id']
+                flat[i, 3] = node['right_id']
+                flat[i, 4] = 0.0  # internal node
+        return flat
