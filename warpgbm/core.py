@@ -174,29 +174,36 @@ class WarpGBM(BaseEstimator, RegressorMixin):
           return 2 ** depth - 1 + node_id
           
         for est in tqdm(range(self.n_estimators)):
+            # print(f"\n--- Growing estimator {est} ---")
             self.residual = self.Y_gpu - self.gradients
             tree_nodes = [{} for _ in range(2 ** (self.max_depth + 1))]
             self.sample_to_node.zero_()
 
+            self.grad_hists[0].zero_()
+            self.hess_hists[0].zero_()
+
             depth_nodes = [0]
             for depth in range(self.max_depth):
+                # print(f"\n[Depth {depth}] depth_nodes: {depth_nodes}")
                 num_nodes = 2**depth
-                self.grad_hists[:num_nodes].zero_()
-                self.hess_hists[:num_nodes].zero_()
+
+                depth_tensor = torch.tensor(depth_nodes, device=self.device, dtype=torch.int32)
+                half_shape = max(int(depth_tensor.shape[0]/2), 1)
+
+                self.grad_hists[half_shape:num_nodes].zero_()
+                self.hess_hists[half_shape:num_nodes].zero_()
                 self.split_gains[:num_nodes].fill_(-float("inf"))
                 self.split_bins[:num_nodes].fill_(-1)
                 self.best_split_feature[:num_nodes].fill_(-1)
                 self.best_split_bin[:num_nodes].fill_(-1)
 
-                depth_tensor = torch.tensor(depth_nodes, device=self.device, dtype=torch.int32)
-
                 if depth == 0:
-                    # At root, there's only one node and no subtraction.
                     right_children_mask = torch.ones_like(self.sample_to_node, dtype=torch.bool)
                 else:
-                    right_children = depth_tensor[2**depth:]  # these are the right children
+                    right_children = depth_tensor[half_shape:]
                     right_children_mask = torch.isin(self.sample_to_node, right_children)
 
+                # print(f"  Building histograms...")
                 node_kernel.build_histograms(
                     self.bin_indices[right_children_mask],
                     self.sample_to_node[right_children_mask], 
@@ -207,13 +214,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     self.rows_per_thread
                 )
 
-                # Subtract right from parent to get left
                 if depth > 0:
-                    for node_id in depth_nodes[:2**depth]:
-                        right_id = 2**depth + node_id
-                        self.grad_hists[node_id] -= self.grad_hists[right_id]
-                        self.hess_hists[node_id] -= self.hess_hists[right_id]
+                    for i, node_id in enumerate( depth_nodes[:half_shape] ):
+                        right_id = depth_nodes[half_shape+i]
+                        # print(node_id, right_id)
+                        self.grad_hists[node_id] = self.grad_hists[node_id] - self.grad_hists[right_id]
+                        self.hess_hists[node_id] = self.hess_hists[node_id] - self.hess_hists[right_id]
 
+
+                # print(f"  Histograms (grad) at depth {depth}:\n", self.grad_hists[:num_nodes])
+                # print(f"  Histograms (hess) at depth {depth}:\n", self.hess_hists[:num_nodes])
+
+                # print(f"  Finding best splits...")
                 node_kernel.find_splits_for_level(
                     depth_tensor,
                     self.grad_hists,
@@ -225,6 +237,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     self.split_bins,
                     self.threads_per_block
                 )
+                # print(f"  Split gains: {self.split_gains[depth_tensor]}")
+                # print(f"  Split bins: {self.split_bins[depth_tensor]}")
 
                 best_features = torch.argmax(self.split_gains[depth_tensor], dim=1)
                 best_bins = self.split_bins[depth_tensor, best_features]
@@ -232,11 +246,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 self.best_split_feature[depth_tensor] = best_features.to(torch.int32)
                 self.best_split_bin[depth_tensor] = best_bins.to(torch.int32)
 
-                new_depth_nodes = []
+                # print(f"  Best  features {self.best_split_feature[depth_tensor]}")
+                # print(f"  Bin {self.best_split_bin[depth_tensor]}")
+
+                new_right_nodes = []
+                new_left_nodes = []
                 for node_id in depth_nodes:
                     if self.best_split_bin[node_id] > -1:
-                        feat = self.best_split_feature[ node_id ].item()
-                        thresh = self.best_split_bin[ node_id ].item()
+                        feat = self.best_split_feature[node_id].item()
+                        thresh = self.best_split_bin[node_id].item()
                         new_left_node = node_id
                         new_right_node = 2**depth + node_id
                         tree_node = { 
@@ -247,42 +265,43 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                             "split_bin": thresh,
                             "depth": depth
                         }
-                        new_depth_nodes += [new_left_node, new_right_node]
-                        
+                        new_right_nodes.append(new_right_node)
+                        new_left_nodes.append(new_left_node)
+
                         left_mask = (self.sample_to_node == node_id) & (self.bin_indices[:, feat] <= thresh)
                         right_mask = (self.sample_to_node == node_id) & (self.bin_indices[:, feat] > thresh)
-                
+
                         self.sample_to_node[left_mask] = new_left_node
                         self.sample_to_node[right_mask] = new_right_node
                     else:
                         node_mask = self.sample_to_node == node_id
-                        leaf_val = torch.mean( self.residual[ node_mask ] )
+                        leaf_val = torch.mean(self.residual[node_mask])
                         tree_node = { 
                             "node_id": node_index(depth, node_id),
                             "leaf_value": leaf_val,
                             "depth": depth
                         }
-                        #update gradients
                         self.gradients[node_mask] += self.learning_rate * leaf_val
                         self.sample_to_node[node_mask] = -1
-                    tree_nodes[ node_index(depth, node_id) ] = tree_node
+                    tree_nodes[node_index(depth, node_id)] = tree_node
 
-                depth_nodes = new_depth_nodes
+                depth_nodes = new_left_nodes + new_right_nodes
+                # print(f"  New depth_nodes: {depth_nodes}")
                 if len(depth_nodes) == 0:
                     break
+
             if len(depth_nodes) > 0:
                 depth = depth + 1
                 for node_id in depth_nodes:
                     node_mask = self.sample_to_node == node_id
-                    leaf_val = torch.mean( self.residual[ node_mask ] )
+                    leaf_val = torch.mean(self.residual[node_mask])
                     tree_node = { 
                         "node_id": node_index(depth, node_id),
                         "leaf_value": leaf_val,
                         "depth": depth
                     }
-                    #update gradients
                     self.gradients[node_mask] += self.learning_rate * leaf_val
-                    tree_nodes[ node_index(depth, node_id) ] = tree_node
+                    tree_nodes[node_index(depth, node_id)] = tree_node
             forest.append(tree_nodes)
         final_corr = torch.corrcoef(torch.stack([self.gradients, self.Y_gpu]))[0, 1]
         print(f"[final model] In-sample correlation: {final_corr.item():.5f}")
