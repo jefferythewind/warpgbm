@@ -292,6 +292,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     tree_nodes[node_index(depth, node_id)] = tree_node
 
                 depth_nodes = new_left_nodes + new_right_nodes
+                # depth_nodes = self.process_depth(depth, depth_tensor, tree_nodes)
                 # print(f"  New depth_nodes: {depth_nodes}")
                 if len(depth_nodes) == 0:
                     break
@@ -363,3 +364,96 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 flat[i, 3] = node['right_id']
                 flat[i, 4] = 0.0  # internal node
         return flat
+
+    def process_depth(self, 
+        depth, depth_nodes, tree_nodes
+    ):
+        """
+        Vectorized processing of tree nodes at a given depth:
+        - Splits samples by best_split_feature/bin thresholds
+        - Routes samples to children or marks leaves
+        - Updates gradients for leaves
+        - Builds new depth_nodes list and tree_nodes entries
+        """
+        def node_index(depth, node_id):
+          return 2 ** depth - 1 + node_id
+
+        # Device and constants
+        device = self.device
+        N = self.sample_to_node.size(0)
+        
+        # Convert depth_nodes to a tensor
+        dn = torch.tensor(depth_nodes, dtype=torch.int64, device=device)
+        
+        # Gather per-node split parameters
+        split_feat   = self.best_split_feature  # [max_nodes]
+        split_thresh = self.best_split_bin      # [max_nodes]
+        
+        # Gather per-sample split info
+        stn         = self.sample_to_node       # [N]
+        feat_samp   = split_feat[stn]           # [N]
+        thresh_samp = split_thresh[stn]         # [N]
+        bin_vals    = self.bin_indices[
+            :, feat_samp
+        ]                                       # [N]
+        
+        # Determine splitable samples and right-going samples
+        splitable = thresh_samp >= 0
+        go_right  = splitable & (bin_vals > thresh_samp)
+        
+        # Compute new node assignments
+        new_stn = stn + go_right.long() * (1 << depth)
+        
+        # Handle leaves: mean residual per leaf-node
+        leaf_mask    = ~splitable
+        old_leaf_ids = stn[leaf_mask]
+        resid_leaf   = self.residual[leaf_mask]
+        
+        # Unique leaf node IDs and scatter-based mean
+        uniq_leaf, inv = torch.unique(old_leaf_ids, return_inverse=True)
+        num_leaf_nodes = uniq_leaf.size(0)
+        sum_vals = torch.zeros(num_leaf_nodes, device=device)
+        count    = torch.zeros(num_leaf_nodes, device=device)
+        
+        sum_vals = sum_vals.scatter_add(0, inv, resid_leaf)
+        count    = count.scatter_add(0, inv, torch.ones_like(inv, dtype=count.dtype))
+        
+        leaf_vals_per_node   = sum_vals / count
+        leaf_vals_per_sample = leaf_vals_per_node[inv]
+        
+        # Update gradients and mark leaves
+        self.gradients[leaf_mask] += self.learning_rate * leaf_vals_per_sample
+        new_stn[leaf_mask] = -1
+        
+        # Commit new assignments
+        self.sample_to_node = new_stn
+        
+        # Build new depth_nodes and tree_nodes entries
+        node_mask   = split_thresh[dn] >= 0
+        left_nodes  = dn[node_mask]
+        right_nodes = left_nodes + (1 << depth)
+        
+        # Update tree_nodes (still small overhead)
+        for node_id in left_nodes.tolist():
+            nd = node_index(depth, node_id)
+            tree_nodes[nd] = {
+                "node_id": nd,
+                "left_id": node_index(depth+1, node_id),
+                "right_id": node_index(depth+1, node_id + (1 << depth)),
+                "best_feature": split_feat[node_id].item(),
+                "split_bin": split_thresh[node_id].item(),
+                "depth": depth
+            }
+        
+        # Leaf entries
+        for i, node_id in enumerate(uniq_leaf.tolist()):
+            nd      = node_index(depth, node_id)
+            leaf_val = leaf_vals_per_node[i].item()
+            tree_nodes[nd] = {
+                "node_id": nd,
+                "leaf_value": leaf_val,
+                "depth": depth
+            }
+        
+        # Return updated depth_nodes for next depth
+        return left_nodes.tolist() + right_nodes.tolist()
