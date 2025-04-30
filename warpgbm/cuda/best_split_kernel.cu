@@ -22,7 +22,7 @@ __global__ void best_split_kernel_levelwise(
     int f = global_id % F;
     int n = node_ids[local_n]; // actual global node id
 
-    int base_idx = local_n * F * B + f * B; // indexing into local G/H
+    int base_idx = n * F * B + f * B; // indexing into local G/H
 
     float G_total = 0.0f, H_total = 0.0f;
     for (int b = 0; b < B; ++b)
