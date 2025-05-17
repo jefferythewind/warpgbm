@@ -248,3 +248,109 @@ void launch_histogram_kernel_cuda_configurable(
         printf("CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
     }
 }
+
+// -----------------------------------------------
+// histogram_tiled_era.cu
+// -----------------------------------------------
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template<typename BinT, typename EraT>
+__global__ void histogram_tiled_era_kernel(
+    const BinT*   __restrict__ bin_indices, // [N, F]
+    const EraT*   __restrict__ era_ids,     // [N]
+    const float*  __restrict__ gradients,   // [N]
+    float*        __restrict__ grad_hist,   // [F * (B*E)]
+    float*        __restrict__ hess_hist,   // [F * (B*E)]
+    int64_t       N,
+    int64_t       F,
+    int           B,
+    int           E,
+    int           rows_per_thread)
+{
+    // feature this block is responsible for
+    int feat = blockIdx.x;
+    // which “tile” of rows this thread will start at
+    int64_t tile = blockIdx.y * blockDim.x + threadIdx.x;
+    int64_t row_start = tile * rows_per_thread;
+
+    // shared workspace: 2 × (B*E) floats
+    extern __shared__ float shmem[];
+    float* sh_grad = shmem;               // length = B*E
+    float* sh_hess = sh_grad + (B * E);   // next B*E
+
+    // zero out shared hist
+    int64_t total_bins = B * E;
+    for (int idx = threadIdx.x; idx < total_bins; idx += blockDim.x) {
+        sh_grad[idx] = 0.0f;
+        sh_hess[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    // accumulate into shared mem
+    for (int r = 0; r < rows_per_thread; ++r) {
+        int64_t row = row_start + r;
+        if (row < N) {
+            BinT bin = bin_indices[row * F + feat];
+            EraT era = era_ids[row];
+            if (bin >= 0 && bin < B && era >= 0 && era < E) {
+                int idx = int(era) * B + int(bin);
+                atomicAdd(&sh_grad[idx], gradients[row]);
+                atomicAdd(&sh_hess[idx], 1.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    // flush shared → global
+    for (int idx = threadIdx.x; idx < total_bins; idx += blockDim.x) {
+        int64_t out = feat * total_bins + idx;
+        atomicAdd(&grad_hist[out], sh_grad[idx]);
+        atomicAdd(&hess_hist[out], sh_hess[idx]);
+    }
+}
+
+
+// -----------------------------------------------
+// launcher (in your .cu or .cpp binding file)
+// -----------------------------------------------
+void launch_histogram_tiled_era(
+    const at::Tensor &bin_indices,  // int8
+    const at::Tensor &era_ids,      // int16
+    const at::Tensor &gradients,    // float
+    at::Tensor &grad_hist,          // float, shape [F, B*E]
+    at::Tensor &hess_hist,          // float, shape [F, B*E]
+    int             B,
+    int             E,
+    int             threads_per_block = 256,
+    int             rows_per_thread   = 4)
+{
+    int64_t N = bin_indices.size(0);
+    int64_t F = bin_indices.size(1);
+
+    // how many row-tiles to cover all N rows
+    int rows_per_block = threads_per_block * rows_per_thread;
+    int row_tiles = (N + rows_per_block - 1) / rows_per_block;
+
+    dim3 grid(F, row_tiles);
+    dim3 block(threads_per_block);
+    // shared mem = 2 × (B*E) floats
+    int shared_bytes = 2 * B * E * sizeof(float);
+
+    // instantiate with the right types
+    histogram_tiled_era_kernel<int8_t,int16_t>
+        <<<grid,block,shared_bytes>>>(
+            bin_indices.data_ptr<int8_t>(),
+            era_ids.data_ptr<int16_t>(),
+            gradients.data_ptr<float>(),
+            grad_hist.data_ptr<float>(),
+            hess_hist.data_ptr<float>(),
+            N, F, B, E, rows_per_thread
+        );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("histogram_tiled_era_kernel launch failed: %s\n",
+               cudaGetErrorString(err));
+    }
+}

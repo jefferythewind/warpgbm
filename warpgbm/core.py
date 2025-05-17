@@ -232,9 +232,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             era_id = np.ones(X.shape[0], dtype="int32")
 
         # Train data preprocessing
-        self.bin_indices, era_indices, self.bin_edges, self.unique_eras, self.Y_gpu = (
+        self.bin_indices, self.era_indices, self.bin_edges, self.unique_eras, self.Y_gpu = (
             self.preprocess_gpu_data(X, y, era_id)
         )
+        self.era_indices = self.era_indices.to(torch.int16)
         self.num_samples, self.num_features = X.shape
         self.gradients = torch.zeros_like(self.Y_gpu)
         self.root_node_indices = torch.arange(self.num_samples, device=self.device)
@@ -331,97 +332,236 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             unique_eras, era_indices = torch.unique(era_id_gpu, return_inverse=True)
             return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
 
-    def compute_histograms(self, bin_indices_sub, gradients):
-        grad_hist = torch.zeros(
-            (self.num_features, self.num_bins), device=self.device, dtype=torch.float32
-        )
-        hess_hist = torch.zeros(
-            (self.num_features, self.num_bins), device=self.device, dtype=torch.float32
-        )
+    def compute_histograms(self,
+                           bin_indices_sub: torch.Tensor,  # [N, F_sub], int8
+                           gradients: torch.Tensor,        # [N], float32
+                           era_ids: torch.Tensor           # [N], int16
+                          ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Builds a [F_sub, B*E] gradient & hessian histogram in one GPU pass.
 
-        self.compute_histogram(
-            bin_indices_sub,
-            gradients,
-            grad_hist,
-            hess_hist,
-            self.num_bins,
-            self.threads_per_block,
-            self.rows_per_thread,
-        )
+        Parameters
+        ----------
+        bin_indices_sub : (N, F_sub) int8 tensor of binned features
+        gradients       : (N,) float32 tensor of residuals
+        era_ids         : (N,) int16 tensor of era IDs in [0, E)
+
+        Returns
+        -------
+        grad_hist : (F_sub, B*E) float32 tensor
+        hess_hist : (F_sub, B*E) float32 tensor
+        """
+        N, F_sub = bin_indices_sub.shape
+        B        = self.num_bins
+        E        = len(self.unique_eras)
+
+        # allocate output
+        grad_hist = torch.zeros((F_sub, B * E),
+                                device=self.device, dtype=torch.float32)
+        hess_hist = torch.zeros_like(grad_hist)
+
+        if N > 0:
+            # kernel expects contiguous inputs
+            self.compute_histogram(
+                bin_indices_sub.contiguous(),
+                era_ids.contiguous(),
+                gradients.contiguous(),
+                grad_hist,
+                hess_hist,
+                B,
+                E,
+                self.threads_per_block,
+                self.rows_per_thread
+            )
+
         return grad_hist, hess_hist
 
-    def find_best_split(self, gradient_histogram, hessian_histogram):
-        node_kernel.compute_split(
-            gradient_histogram,
-            hessian_histogram,
-            self.min_split_gain,
-            self.min_child_weight,
-            self.L2_reg,
-            self.best_gains,
-            self.best_bins,
-            self.threads_per_block,
+  
+
+    def find_best_split(self,
+                    grad_hist_flat: torch.Tensor,
+                    hess_hist_flat: torch.Tensor
+                   ) -> Tuple[int, int]:
+        """
+        1) If E == 1, call compute_split kernel on [F, B] hists directly.
+        2) Else, do the DES directional pass + early exits + tie‐breaker kernel.
+        """
+        import torch
+        from warpgbm.cuda.node_kernel import compute_split
+
+        F, BE = grad_hist_flat.shape
+        B     = self.num_bins
+        E     = BE // B
+
+        #print("num_eras =", E)
+
+        # --- special case: single era → skip DES, use kernel across all features
+        if E == 1:
+            G_sum = grad_hist_flat  # [F, B]
+            H_sum = hess_hist_flat
+
+            if not hasattr(self, "_best_gains") or self._best_gains.numel() < F:
+                self._best_gains = torch.empty((F,), device=G_sum.device, dtype=torch.float32)
+                self._best_bins  = torch.empty((F,), device=G_sum.device, dtype=torch.int32)
+
+            threads = min(self.threads_per_block, F)
+            compute_split(
+                G_sum, H_sum,
+                float(self.min_split_gain),
+                float(self.min_child_weight),
+                1e-6,
+                self._best_gains,
+                self._best_bins,
+                threads
+            )
+
+            # if no valid split at all
+            if torch.all(self._best_bins == -1):
+                return -1, -1
+
+            f = int(self._best_gains.argmax().item())
+            b = int(self._best_bins[f].item())
+            return f, b
+
+        # --- otherwise: DES with directional pass + tie‐breaker ---
+        G  = grad_hist_flat.view(F, E, B).transpose(1, 2)  # [F, B, E]
+        H  = hess_hist_flat.view(F, E, B).transpose(1, 2)  # [F, B, E]
+        CG = G.cumsum(dim=1)
+        CH = H.cumsum(dim=1)
+
+        GL = CG[:, :-1, :]   # [F, B-1, E]
+        HL = CH[:, :-1, :]
+        TG = CG[:,   -1, :]  # [F, E]
+        TH = CH[:,   -1, :]
+        GR = TG[:, None, :] - GL
+        HR = TH[:, None, :] - HL
+
+        valid = (
+            (HL >= self.min_child_weight).all(dim=2)
+          & (HR >= self.min_child_weight).all(dim=2)
+        )  # [F, B-1]
+        if not valid.any():
+            return -1, -1
+
+        dirs      = torch.sign(GL/(HL+1e-6) - GR/(HR+1e-6))  # [F, B-1, E]
+        dir_score = dirs.sum(dim=2).abs().div(E)              # [F, B-1]
+        dir_score = dir_score.masked_fill(~valid, float('-inf'))
+
+        max_dir = dir_score.max()
+        if max_dir == -float('inf'):
+            return -1, -1
+
+        per_feat_max = dir_score.max(dim=1).values  # [F]
+        tie_feats    = (per_feat_max == max_dir).nonzero().view(-1)
+
+        if tie_feats.numel() <= 1:
+            if tie_feats.numel() == 0:
+              return -1, -1
+            f = int(tie_feats.item())
+            b = int(dir_score[f].argmax().item())
+            return f, b
+
+        # collapse eras → [F, B]
+        G_sum = G.sum(dim=2)
+        H_sum = H.sum(dim=2)
+
+        G_tie = G_sum[tie_feats]  # [K, B]
+        H_tie = H_sum[tie_feats]
+        K     = G_tie.size(0)
+
+        if not hasattr(self, "_best_gains") or self._best_gains.numel() < K:
+            self._best_gains = torch.empty((K,), device=G_tie.device, dtype=torch.float32)
+            self._best_bins  = torch.empty((K,), device=G_tie.device, dtype=torch.int32)
+        else:
+            self._best_gains = self._best_gains[:K]
+            self._best_bins  = self._best_bins[:K]
+
+        threads = min(self.threads_per_block, K)
+        compute_split(
+            G_tie, H_tie,
+            float(self.min_split_gain),
+            float(self.min_child_weight),
+            1e-6,
+            self._best_gains,
+            self._best_bins,
+            threads
         )
 
-        if torch.all(self.best_bins == -1):
-            return -1, -1  # No valid split found
+        # if no valid split among tied features
+        if torch.all(self._best_bins == -1):
+            return -1, -1
 
-        f = torch.argmax(self.best_gains).item()
-        b = self.best_bins[f].item()
+        rel     = int(self._best_gains.argmax().item())
+        f_final = int(tie_feats[rel].item())
+        b_final = int(self._best_bins[rel].item())
+        return f_final, b_final
 
-        return f, b
+
+
+
+
 
     def grow_tree(self, gradient_histogram, hessian_histogram, node_indices, depth):
+        # Terminal condition
         if depth == self.max_depth:
             leaf_value = self.residual[node_indices].mean()
             self.gradients[node_indices] += self.learning_rate * leaf_value
             return {"leaf_value": leaf_value.item(), "samples": node_indices.numel()}
 
         parent_size = node_indices.numel()
-        local_feature, best_bin = self.find_best_split(
+
+        # 1) find best feature & composite bin (in [0, B*E))
+        local_feat_idx, comp_bin = self.find_best_split(
             gradient_histogram, hessian_histogram
         )
-
-        if local_feature == -1:
+        if local_feat_idx == -1:
             leaf_value = self.residual[node_indices].mean()
             self.gradients[node_indices] += self.learning_rate * leaf_value
             return {"leaf_value": leaf_value.item(), "samples": parent_size}
 
-        split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
-        left_indices = node_indices[split_mask]
+        # map local index → global feature id
+        feat_id = self.feat_indices_tree[local_feat_idx]
+        B       = self.num_bins  # original bin count
+        # 2) split mask: use composite code = era*B + raw_bin
+        codes = self.bin_indices[node_indices, feat_id]
+          
+    
+        split_mask = codes <= comp_bin
+
+        left_indices  = node_indices[split_mask]
         right_indices = node_indices[~split_mask]
+        left_size     = left_indices.numel()
+        right_size    = right_indices.numel()
 
-        left_size = left_indices.numel()
-        right_size = right_indices.numel()
-
+        # 3) rebuild the smaller side’s hist, infer the other by subtraction
         if left_size <= right_size:
-            grad_hist_left, hess_hist_left = self.compute_histograms(
-                self.bin_indices.index_select(0, left_indices).index_select(1, self.feat_indices_tree)
-, self.residual[left_indices]
+            gradL, hessL = self.compute_histograms(
+                self.bin_indices[left_indices][:, self.feat_indices_tree],
+                self.residual[left_indices],
+                self.era_indices[left_indices],
             )
-            grad_hist_right = gradient_histogram - grad_hist_left
-            hess_hist_right = hessian_histogram - hess_hist_left
+            gradR = gradient_histogram - gradL
+            hessR = hessian_histogram  - hessL
         else:
-            grad_hist_right, hess_hist_right = self.compute_histograms(
-                self.bin_indices.index_select(0, right_indices).index_select(1, self.feat_indices_tree)
-, self.residual[right_indices]
+            gradR, hessR = self.compute_histograms(
+                self.bin_indices[right_indices][:, self.feat_indices_tree],
+                self.residual[right_indices],
+                self.era_indices[right_indices],
             )
-            grad_hist_left = gradient_histogram - grad_hist_right
-            hess_hist_left = hessian_histogram - hess_hist_right
+            gradL = gradient_histogram - gradR
+            hessL = hessian_histogram  - hessR
 
-        new_depth = depth + 1
-        left_child = self.grow_tree(
-            grad_hist_left, hess_hist_left, left_indices, new_depth
-        )
-        right_child = self.grow_tree(
-            grad_hist_right, hess_hist_right, right_indices, new_depth
-        )
+        # 4) recurse
+        left_child  = self.grow_tree(gradL, hessL, left_indices,  depth + 1)
+        right_child = self.grow_tree(gradR, hessR, right_indices, depth + 1)
 
         return {
-            "feature": self.feat_indices_tree[local_feature],
-            "bin": best_bin,
-            "left": left_child,
-            "right": right_child,
+            "feature": feat_id,
+            "bin":     comp_bin,  # composite in [0, B*E)
+            "left":    left_child,
+            "right":   right_child,
         }
+
     
     def get_eval_metric(self, y_true, y_pred):
         if self.eval_metric == "mse":
@@ -455,40 +595,53 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def grow_forest(self):
         self.training_loss = []
-        self.eval_loss = []  # if eval set is given
+        self.eval_loss = []
         self.stop = False
 
+        # precompute number of eras
+        E = int(self.era_indices.max().item()) + 1
+
+        # adjust colsample logic
         if self.colsample_bytree < 1.0:
             k = max(1, int(self.colsample_bytree * self.num_features))
         else:
             self.feat_indices_tree = self.feature_indices
 
         for i in range(self.n_estimators):
+            # 1) residual
             self.residual = self.Y_gpu - self.gradients
 
+            # 2) feature subsample if needed
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(
                     self.num_features, device=self.device
                 )[:k]
 
+            # 3) era-aware histogram via composite keys
+            #    bin_sub: [N, F_sub]
+            bin_sub = self.bin_indices[:, self.feat_indices_tree]
+
+            # compute_histograms now takes era_ids and returns [F_sub, B*E]
             self.root_gradient_histogram, self.root_hessian_histogram = (
-                self.compute_histograms(self.bin_indices[:, self.feat_indices_tree], self.residual)
+                self.compute_histograms(bin_sub, self.residual, self.era_indices)
             )
 
+            # 4) grow tree as before (best_bins now in [0, B*E))
             tree = self.grow_tree(
                 self.root_gradient_histogram,
                 self.root_hessian_histogram,
                 self.root_node_indices,
-                0,
+                depth=0,
             )
             self.forest[i] = tree
 
+            # 5) eval / early stop
             self.compute_eval(i)
-
             if self.stop:
                 break
 
         print("Finished training forest.")
+
 
     def bin_data_with_existing_edges(self, X_np):
         X_tensor = torch.from_numpy(X_np).type(torch.float32).pin_memory()
