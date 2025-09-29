@@ -289,7 +289,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 unique_eras, era_indices = torch.unique(
                     era_id_gpu, return_inverse=True
                 )
-                return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
+                #NOTE: feature major bin indices
+                return bin_indices.t().contiguous(), era_indices, bin_edges, unique_eras, Y_gpu
             
             print("quantile binning.")
 
@@ -313,7 +314,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 bin_edges[f, :] = bin_edges_f
 
             unique_eras, era_indices = torch.unique(era_id_gpu, return_inverse=True)
-            return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
+            #NOTE feature major bin indices
+            return bin_indices.t().contiguous(), era_indices, bin_edges, unique_eras, Y_gpu
 
     def compute_histograms(self, sample_indices, feature_indices):
         grad_hist = torch.zeros(
@@ -326,6 +328,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         node_kernel.compute_histogram3(
             self.bin_indices,
             self.residual,
+            torch.ones_like(self.residual),
             sample_indices,
             feature_indices,
             self.era_indices,
@@ -385,7 +388,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.gradients[node_indices] += self.learning_rate * leaf_value
             return {"leaf_value": leaf_value.item(), "samples": parent_size}
         
-        split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
+        #NOTE feature-major layout
+        split_mask = self.bin_indices[self.feat_indices_tree[local_feature], node_indices] <= best_bin
         left_indices = node_indices[split_mask]
         right_indices = node_indices[~split_mask]
 
