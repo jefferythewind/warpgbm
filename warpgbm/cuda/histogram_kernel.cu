@@ -10,31 +10,31 @@ __device__ __forceinline__
 void warp_agg_add(float* __restrict__ shG, float* __restrict__ shH,
                   int key, float g, float h)
 {
-    unsigned mask = __activemask();
-    // If key is invalid, just return (no update).
     if (key < 0) return;
 
-    // Find all lanes in the warp with the same 'key'
-    unsigned group = __match_any_sync(mask, key);
-    int lane = threadIdx.x & 31;
-    int leader = __ffs(group) - 1; // first set bit
+    const unsigned warp_mask = __activemask();
+    const unsigned group     = __match_any_sync(warp_mask, key); // same for all lanes with this key @TODO P100 support
+    const int lane = threadIdx.x & 31;
 
-    // Sum g/h across the group (simple bit-walk)
+    // Butterfly reduce strictly within 'group' with a uniform number of shuffles
     float gsum = g, hsum = h;
-    unsigned remaining = group & ~(1u << lane);
-    while (remaining) {
-        int l = __ffs(remaining) - 1;
-        gsum += __shfl_sync(mask, g, l);
-        hsum += __shfl_sync(mask, h, l);
-        remaining &= (remaining - 1);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float g_peer = __shfl_down_sync(group, gsum, offset);
+        float h_peer = __shfl_down_sync(group, hsum, offset);
+        unsigned dst = lane + offset;
+        if (dst < 32 && (group & (1u << dst))) {
+            gsum += g_peer;
+            hsum += h_peer;
+        }
     }
 
-    // Only the leader lane does the atomic add into shared
+    const int leader = __ffs(group) - 1;
     if (lane == leader) {
         atomicAdd(&shG[key], gsum);
         atomicAdd(&shH[key], hsum);
     }
 }
+
 
 // FM + warp-aggregated GH histogram (shared-memory block accumulation, then global flush).
 // Shapes:
@@ -104,12 +104,20 @@ __global__ void histogram_gh_fm_warpagg_kernel(
 
     // --- Flush shared histogram to global with one atomic per (e,bin) per block ---
     for (int i = tid; i < E * B; i += blockDim.x) {
-        const int e   = i / B;
-        const int bin = i % B;
-        const int64_t out_idx = ((int64_t)e * F_sub + k) * B + bin;
-        atomicAdd(&grad_hist[out_idx], shG[i]);
-        atomicAdd(&hess_hist[out_idx], shH[i]);
+        float g = shG[i];
+        float h = shH[i];
+        if (g != 0.0f) {
+            int e = i / B, b = i % B;
+            int64_t out_idx = ((int64_t)e * F_sub + k) * B + b;
+            atomicAdd(&grad_hist[out_idx], g);
+        }
+        if (h != 0.0f) {
+            int e = i / B, b = i % B;
+            int64_t out_idx = ((int64_t)e * F_sub + k) * B + b;
+            atomicAdd(&hess_hist[out_idx], h);
+        }
     }
+    
 }
 
 // Launcher
