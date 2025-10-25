@@ -27,6 +27,18 @@ static inline int choose_warps_per_block(size_t smem_cap_bytes, int B, int pad =
   return 2;
 }
 
+// Helper: masked warp sum (works across arbitrary peer masks, avoids __reduce_add_sync(float))
+__device__ __forceinline__ float warp_sum_mask(unsigned mask, float v) {
+  float acc = 0.0f;
+  unsigned m = mask;
+  while (m) {
+    int src = __ffs(m) - 1;           // next lane in the group
+    acc += __shfl_sync(mask, v, src);  // fetch its value
+    m &= (m - 1);                      // clear lowest set bit
+  }
+  return acc;                          // valid on all lanes; we only use it on leader
+}
+
 // ==========================
 // 1) One-pass era compaction (butterfly)
 //    heads[c,e] is zeroed before launch; becomes the final count after launch.
@@ -157,8 +169,8 @@ __global__ void _h_des_mc_bfly(
     unsigned full   = __activemask();
     unsigned peers  = __match_any_sync(full, bin);
     const int leader= __ffs(peers) - 1;
-    const float g_sum = __reduce_add_sync(peers, g);
-    const float h_sum = __reduce_add_sync(peers, h);
+    const float g_sum = warp_sum_mask(peers, g);
+    const float h_sum = warp_sum_mask(peers, h);
 
     if (lane == leader) {
       atomicAdd(&sG[warp * stride + bin], g_sum);
