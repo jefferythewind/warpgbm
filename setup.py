@@ -24,6 +24,7 @@ def get_extensions():
                     "warpgbm/cuda/best_split_kernel.cu",
                     "warpgbm/cuda/binner.cu",
                     "warpgbm/cuda/predict.cu",
+                    "warpgbm/cuda/h_des_mc.cu",
                     "warpgbm/cuda/node_kernel.cpp",
                 ]
             )

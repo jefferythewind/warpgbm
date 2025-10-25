@@ -37,6 +37,19 @@ void predict_with_forest(
     at::Tensor &out // [N], float32
 );
 
+torch::Tensor h_des_mc(
+    torch::Tensor bin_idx,
+    torch::Tensor era_of_row,
+    torch::Tensor G,
+    torch::Tensor H,
+    torch::Tensor feat_idx,
+    torch::Tensor idx_mat,
+    torch::Tensor idx_len,
+    torch::Tensor era_ends,
+    int B,
+    bool enable_compact,
+    bool root_fastpath);
+
 // Bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -44,4 +57,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("compute_split", &launch_directional_split_kernel, "Best Split (CUDA)");
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");
     m.def("predict_forest", &predict_with_forest, "CUDA Predictions");
+    // ---------------- PyBind ----------------
+    m.def("h_des_mc", &h_des_mc,
+          "Multiclass hist (butterfly compact + class-batched butterfly hist) -> [2,E,k,K,B]");
+
+  
 }
