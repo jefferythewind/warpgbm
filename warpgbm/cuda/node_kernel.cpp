@@ -1,5 +1,10 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cstdint>
 #include <vector>
+#include <algorithm>
+
 
 // Declare the function from histogram_kernel.cu
 
@@ -37,18 +42,18 @@ void predict_with_forest(
     at::Tensor &out // [N], float32
 );
 
-torch::Tensor h_des_mc(
-    torch::Tensor bin_idx,
-    torch::Tensor era_of_row,
-    torch::Tensor G,
-    torch::Tensor H,
-    torch::Tensor feat_idx,
-    torch::Tensor idx_mat,
-    torch::Tensor idx_len,
-    torch::Tensor era_ends,
-    int B,
-    bool enable_compact,
-    bool root_fastpath);
+std::vector<Tensor> h_des_mc(
+    Tensor bin_indices,   // [N, F_master] int8
+    Tensor grads,         // [N, K] float32
+    Tensor hess,          // [N, K] float32
+    Tensor idx_mat,       // [K, Mmax] int32
+    Tensor idx_len,       // [K] int32
+    Tensor feat_idx,      // [k] int32
+    Tensor era_indices,   // [N] int32
+    int num_bins,         // B
+    int K_tile_hint,
+    int threads_per_block_hint
+);
 
 // Bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -57,9 +62,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("compute_split", &launch_directional_split_kernel, "Best Split (CUDA)");
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");
     m.def("predict_forest", &predict_with_forest, "CUDA Predictions");
-    // ---------------- PyBind ----------------
     m.def("h_des_mc", &h_des_mc,
-          "Multiclass hist (butterfly compact + class-batched butterfly hist) -> [2,E,k,K,B]");
+        "Multiclass per-node histogram (class-tiling, warp-per-class; shared/atomic fallback)");
 
   
 }

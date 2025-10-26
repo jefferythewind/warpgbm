@@ -1,376 +1,325 @@
-// warpgbm/cuda/h_des_mc.cu
-// Multiclass histogram (era-compacted + class-batched) with warp-level butterfly aggregation.
-// - One-pass compactor (_et_compact_bfly_onepass): groups by era using match_any + atomicAdd reservation
-// - Histogram kernel (_h_des_mc_bfly): warp=class, per-warp shared rows, warp-aggregated updates by bin
-// - Root fast-path: if eras are sorted, skip compaction and fabricate contiguous per-era ranges
-//
-// Returns stacked tensor [2, E, k, K, B] (grad, hess)
-
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <vector>
+#include <algorithm>
 
-// ---------------- Helpers ----------------
+using torch::Tensor;
+
+#define WARP 32
+static __forceinline__ __device__ int lane_id() { return threadIdx.x & (WARP - 1); }
+static __forceinline__ __device__ int warp_id() { return threadIdx.x >> 5; }
+
+// Flattened indexer for GH/HH: [E, k, K, B] (contiguous)
+static __forceinline__ __device__ size_t GH_idx(size_t e, size_t k, size_t K, size_t B,
+                                                size_t e_id, size_t k_id, size_t c_id, size_t b_id) {
+  // (((e_id * k + k_id) * K + c_id) * B + b_id)
+  return (((e_id * k + k_id) * K + c_id) * B + b_id);
+}
+
+// =============================
+// Shared-memory variant kernel
+// =============================
+// Each block handles one (feature, class tile).
+// - warps_per_block == tile_K (1 warp per class).
+// - Shared memory layout: [tile_K, E, 2, B] floats (grad, count)
+__global__ void _h_des_mc_smem(
+    const int8_t*  __restrict__ bin_idx,    // [N, F_master]
+    const float*   __restrict__ grads,      // [N, K_total]
+    const float*   __restrict__ hess,       // [N, K_total]
+    const int32_t* __restrict__ idx_mat,    // [K_total, Mmax]
+    const int32_t* __restrict__ idx_len,    // [K_total]
+    const int32_t* __restrict__ feat_idx,   // [k]
+    const int32_t* __restrict__ era_idx,    // [N]
+    float*         __restrict__ GH,         // [E, k, K_total, B]
+    float*         __restrict__ HH,         // [E, k, K_total, B]
+    int N, int F_master,
+    int K_total, int k, int B, int E,
+    int Mmax, int tile_K
+){
+  const int k_local = blockIdx.x;                            // 0..k-1
+  const int tile_id = blockIdx.y;                            // 0..ceil(K_total/tile_K)-1
+  const int c0      = tile_id * tile_K;                      // starting class index in this tile
+  const int c_rel   = warp_id();                             // 0..(tile_K-1) — warp-per-class
+  const int lane    = lane_id();
+
+  if (k_local >= k) return;
+
+  const int K_here = min(tile_K, K_total - c0);              // classes actually in this tile
+  if (c_rel >= K_here) return;                               // extra warps idle (last tile)
+
+  // Global feature id
+  const int f_global = feat_idx[k_local];
+
+  extern __shared__ float shmem[];
+  // Layout: [K_here, E, 2, B]
+  // We pack as a single contiguous array:
+  //   class-major → era → ch(0=grad,1=count) → bin
+  const size_t per_class_elems = (size_t)E * 2 * (size_t)B;
+  float* sh_base = shmem;
+
+  // Zero shared memory collaboratively
+  const int tpb = blockDim.x;
+  const size_t total_elems = (size_t)K_here * per_class_elems;
+  for (size_t i = threadIdx.x; i < total_elems; i += tpb) {
+    sh_base[i] = 0.0f;
+  }
+  __syncthreads();
+
+  // Each warp scans one class's sample list
+  const int c_abs = c0 + c_rel;
+  const int len   = idx_len[c_abs];
+  const int32_t* row_list = &idx_mat[(size_t)c_abs * (size_t)Mmax];
+
+  // Pointer offsets for grads/hess [N, K_total]
+  const size_t g_col_off = (size_t)c_abs;       // column in [K_total]
+  const size_t gh_col_stride = (size_t)K_total; // row-major stride
+
+  // Shared base for this class
+  float* sh_class = sh_base + (size_t)c_rel * per_class_elems;
+
+  // Iterate over class samples with lane-stride
+  for (int p = lane; p < len; p += WARP) {
+    const int s = row_list[p];
+    if ((unsigned)s >= (unsigned)N) continue;
+
+    const int8_t b_raw = bin_idx[(size_t)s * (size_t)F_master + (size_t)f_global];
+    if (b_raw < 0) continue;               // skip missing
+    const int b = (int)b_raw;
+    if (b >= B) continue;
+
+    const int e = (int)era_idx[s];
+    if ((unsigned)e >= (unsigned)E) continue;
+
+    const float g = grads[(size_t)s * gh_col_stride + g_col_off];
+    const float h = hess [(size_t)s * gh_col_stride + g_col_off];
+
+    // sh index: [E, 2, B] → ((e*2 + ch)*B + b)
+    const size_t grad_ofs = ((size_t)e * 2 + 0) * (size_t)B + (size_t)b;
+    const size_t cnt_ofs  = ((size_t)e * 2 + 1) * (size_t)B + (size_t)b;
+
+    // Many lanes may hit the same (e,b) → use shared atomics
+    atomicAdd(&sh_class[grad_ofs], g);
+    atomicAdd(&sh_class[cnt_ofs],  h);
+  }
+  __syncwarp();  // within-warp done; but we need block-wide sync before flush
+  __syncthreads();
+
+  // Flush shared to global (unique writer per element; no global atomics needed)
+  // Each thread writes a subset of [K_here, E, 2, B]
+  for (size_t i = threadIdx.x; i < total_elems; i += tpb) {
+    const size_t cls  = i / per_class_elems;
+    const size_t rem1 = i % per_class_elems;
+    const size_t e2   = rem1 / (2 * (size_t)B);
+    const size_t rem2 = rem1 % (2 * (size_t)B);
+    const size_t ch   = rem2 / (size_t)B;
+    const size_t b2   = rem2 % (size_t)B;
+
+    const float val = sh_base[i];
+    if (val == 0.0f) continue;
+
+    const int c_out = c0 + (int)cls;
+    const size_t out_idx = GH_idx((size_t)E, (size_t)k, (size_t)K_total, (size_t)B,
+                                  e2, (size_t)k_local, (size_t)c_out, b2);
+    if (ch == 0) {
+      GH[out_idx] = GH[out_idx] + val;
+    } else {
+      HH[out_idx] = HH[out_idx] + val;
+    }
+  }
+}
+
+// =================================
+// Global-atomic fallback kernel
+// =================================
+// Same mapping, but no shared memory. We atomically update GH/HH directly.
+__global__ void _h_des_mc_global(
+    const int8_t*  __restrict__ bin_idx,    // [N, F_master]
+    const float*   __restrict__ grads,      // [N, K_total]
+    const float*   __restrict__ hess,       // [N, K_total]
+    const int32_t* __restrict__ idx_mat,    // [K_total, Mmax]
+    const int32_t* __restrict__ idx_len,    // [K_total]
+    const int32_t* __restrict__ feat_idx,   // [k]
+    const int32_t* __restrict__ era_idx,    // [N]
+    float*         __restrict__ GH,         // [E, k, K_total, B]
+    float*         __restrict__ HH,         // [E, k, K_total, B]
+    int N, int F_master,
+    int K_total, int k, int B, int E,
+    int Mmax, int tile_K
+){
+  const int k_local = blockIdx.x;
+  const int tile_id = blockIdx.y;
+  const int c0      = tile_id * tile_K;
+  const int c_rel   = warp_id();
+  const int lane    = lane_id();
+
+  if (k_local >= k) return;
+
+  const int K_here = min(tile_K, K_total - c0);
+  if (c_rel >= K_here) return;
+
+  const int f_global = feat_idx[k_local];
+
+  const int c_abs = c0 + c_rel;
+  const int len   = idx_len[c_abs];
+  const int32_t* row_list = &idx_mat[(size_t)c_abs * (size_t)Mmax];
+
+  const size_t g_col_off = (size_t)c_abs;
+  const size_t gh_col_stride = (size_t)K_total;
+
+  for (int p = lane; p < len; p += WARP) {
+    const int s = row_list[p];
+    if ((unsigned)s >= (unsigned)N) continue;
+
+    const int8_t b_raw = bin_idx[(size_t)s * (size_t)F_master + (size_t)f_global];
+    if (b_raw < 0) continue;
+    const int b = (int)b_raw;
+    if (b >= B) continue;
+
+    const int e = (int)era_idx[s];
+    if ((unsigned)e >= (unsigned)E) continue;
+
+    const float g = grads[(size_t)s * gh_col_stride + g_col_off];
+    const float h = hess [(size_t)s * gh_col_stride + g_col_off];
+
+    const size_t out = GH_idx((size_t)E, (size_t)k, (size_t)K_total, (size_t)B,
+                              (size_t)e, (size_t)k_local, (size_t)c_abs, (size_t)b);
+    atomicAdd(&GH[out], g);
+    atomicAdd(&HH[out], h);
+  }
+}
+
+// ---------- helpers ----------
 static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 
-static inline int choose_warps_per_block(size_t smem_cap_bytes, int B, int pad = 1) {
-  // per-warp shared: sG + sH = 2 * (B + pad) floats
-  size_t per_warp = 2ull * (size_t)(B + pad) * sizeof(float);
-  int wpb = (int)(smem_cap_bytes / per_warp);
-  if (wpb < 1) wpb = 1;
-  if (wpb > 16) wpb = 16;
-  // keep blockDim sane and balanced
-  if (wpb >= 12) return 12;
-  if (wpb >= 8)  return 8;
-  if (wpb >= 4)  return 4;
-  return 2;
-}
+// Host launcher choosing shared/global variant and autotuning K_tile/threads.
+std::vector<Tensor> h_des_mc(
+    Tensor bin_indices,   // [N, F_master] int8
+    Tensor grads,         // [N, K] float32
+    Tensor hess,          // [N, K] float32
+    Tensor idx_mat,       // [K, Mmax] int32
+    Tensor idx_len,       // [K] int32
+    Tensor feat_idx,      // [k] int32
+    Tensor era_indices,   // [N] int32
+    int num_bins,         // B
+    int K_tile_hint,
+    int threads_per_block_hint
+){
+  TORCH_CHECK(bin_indices.is_cuda() && grads.is_cuda() && hess.is_cuda() &&
+              idx_mat.is_cuda() && idx_len.is_cuda() &&
+              feat_idx.is_cuda() && era_indices.is_cuda(),
+              "All tensors must be CUDA.");
 
-// Helper: masked warp sum (works across arbitrary peer masks, avoids __reduce_add_sync(float))
-__device__ __forceinline__ float warp_sum_mask(unsigned mask, float v) {
-  float acc = 0.0f;
-  unsigned m = mask;
-  while (m) {
-    int src = __ffs(m) - 1;           // next lane in the group
-    acc += __shfl_sync(mask, v, src);  // fetch its value
-    m &= (m - 1);                      // clear lowest set bit
-  }
-  return acc;                          // valid on all lanes; we only use it on leader
-}
+  TORCH_CHECK(bin_indices.scalar_type() == torch::kInt8,  "bin_indices must be int8.");
+  TORCH_CHECK(grads.scalar_type() == torch::kFloat,       "grads must be float32.");
+  TORCH_CHECK(hess.scalar_type()  == torch::kFloat,       "hess must be float32.");
+  TORCH_CHECK(idx_mat.scalar_type()== torch::kInt,        "idx_mat must be int32.");
+  TORCH_CHECK(idx_len.scalar_type()== torch::kInt,        "idx_len must be int32.");
+  TORCH_CHECK(feat_idx.scalar_type()== torch::kInt,       "feat_idx must be int32.");
+  TORCH_CHECK(era_indices.scalar_type()== torch::kInt,    "era_indices must be int32.");
+  TORCH_CHECK(bin_indices.dim()==2 && grads.dim()==2 && hess.dim()==2, "bin, grads, hess must be 2D.");
+  TORCH_CHECK(idx_mat.dim()==2 && idx_len.dim()==1 && feat_idx.dim()==1 && era_indices.dim()==1,
+              "idx_mat[K,Mmax], idx_len[K], feat_idx[k], era_indices[N].");
 
-// ==========================
-// 1) One-pass era compaction (butterfly)
-//    heads[c,e] is zeroed before launch; becomes the final count after launch.
-// ==========================
-__global__ void _et_compact_bfly_onepass(
-    const int32_t* __restrict__ idx_mat,    // [K, Mmax]
-    const int32_t* __restrict__ idx_len,    // [K]
-    const int32_t* __restrict__ era_of_row, // [N]
-    int K, int Mmax, int E,
-    int32_t* __restrict__ heads,            // [K, E], zeroed; AFTER: final counts
-    int32_t* __restrict__ idx_out,          // [K, Mmax]
-    int rows_per_thread)                    // e.g., 2 or 4
-{
-  const int c = blockIdx.x;                  // class id
-  if (c >= K) return;
-  const int len = idx_len[c];
-  if (len <= 0) return;
+  const int N        = (int)bin_indices.size(0);
+  const int F_master = (int)bin_indices.size(1);
+  const int K_total  = (int)grads.size(1);
+  const int K_total_h= (int)hess.size(1);
+  TORCH_CHECK(K_total == K_total_h, "grads and hess must have same K columns.");
+  TORCH_CHECK(idx_len.size(0) == K_total, "idx_len[K] must match K.");
+  TORCH_CHECK(idx_mat.size(0) == K_total, "idx_mat[K,*] must match K.");
+  const int Mmax     = (int)idx_mat.size(1);
+  const int k        = (int)feat_idx.size(0);
+  const int B        = num_bins;
 
-  const int warp  = threadIdx.x >> 5;        // 0..W-1
-  const int lane  = threadIdx.x & 31;        // 0..31
-  const int warps = blockDim.x >> 5;
+  // Compute E = 1 + max(era_indices)
+  Tensor e_max = torch::amax(era_indices);
+  int E;
+  cudaMemcpy(&E, e_max.to(torch::kCPU).data_ptr<int>(), sizeof(int), cudaMemcpyHostToHost);
+  E += 1;
+  TORCH_CHECK(E >= 1, "Invalid era_indices (E<1).");
 
-  const int rows_per_block = blockDim.x * rows_per_thread;
-  const int tile = blockIdx.y;
-  const int start = tile * rows_per_block;
-  if (start >= len) return;
-  const int end = min(start + rows_per_block, len);
+  // Allocate outputs: [E, k, K, B]
+  auto opts = grads.options().dtype(torch::kFloat).memory_format(c10::MemoryFormat::Contiguous);
+  Tensor GH = torch::zeros({(int64_t)E, (int64_t)k, (int64_t)K_total, (int64_t)B}, opts);
+  Tensor HH = torch::zeros_like(GH);
 
-  // strip-mine this tile across warps; each lane gets distinct i
-  for (int i0 = start + warp * 32; i0 < end; i0 += warps * 32) {
-    #pragma unroll
-    for (int step = 0; step < rows_per_thread; ++step) {
-      int i = i0 + lane + step * blockDim.x;
-      if (i >= end) break;
-
-      const int n = idx_mat[(size_t)c * (size_t)Mmax + i];
-      const int e = era_of_row[n];                 // grouping key
-
-      // group lanes with same era inside this warp
-      unsigned full   = __activemask();
-      unsigned peers  = __match_any_sync(full, e);
-      const int leader= __ffs(peers) - 1;
-      const int gsize = __popc(peers);
-
-      // leader reserves contiguous block for the group in heads[c,e]
-      int base = 0;
-      if (lane == leader) {
-        base = atomicAdd(&heads[(size_t)c * (size_t)E + e], gsize);
-      }
-      // broadcast base to the group only
-      base = __shfl_sync(peers, base, leader);
-
-      // rank within group (prefix count)
-      const unsigned lower = peers & ((1u << lane) - 1u);
-      const int rank = __popc(lower);
-
-      // scatter into class-compacted output
-      const int pos = base + rank;
-      idx_out[(size_t)c * (size_t)Mmax + pos] = n;
-    }
-  }
-}
-
-// Heads (counts) -> per-class era offsets (exclusive scan)
-__global__ void _scan_counts_to_offsets(
-    const int32_t* __restrict__ counts, // [K,E]
-    int K, int E,
-    int32_t* __restrict__ off_era)      // [K,E+1]
-{
-  const int c = blockIdx.x;
-  if (c >= K) return;
-  int acc = 0;
-  for (int e = 0; e < E; ++e) {
-    off_era[(size_t)c * (size_t)(E + 1) + e] = acc;
-    acc += counts[(size_t)c * (size_t)E + e];
-  }
-  off_era[(size_t)c * (size_t)(E + 1) + E] = acc;
-}
-
-// ==========================
-// 2) Class-batched histogram (butterfly), warp=class
-// ==========================
-__global__ void _h_des_mc_bfly(
-    const int8_t*  __restrict__ bin_idx,   // [N,F]
-    const float*   __restrict__ G,         // [N,K]
-    const float*   __restrict__ H,         // [N,K]
-    const int32_t* __restrict__ feat_idx,  // [k]
-    const int32_t* __restrict__ idx_out,   // [K,Mmax]
-    const int32_t* __restrict__ off_era,   // [K,E+1]
-    float* __restrict__ GH,                // [E,k,K,B]
-    float* __restrict__ HH,                // [E,k,K,B]
-    int N, int F, int K, int E, int k, int B, int Mmax,
-    int pad)                               // shared-row padding (avoid bank conflicts)
-{
-  const int j    = blockIdx.x;                // feature in subset
-  const int era  = blockIdx.y;                // era id
-  const int wpb  = blockDim.x >> 5;           // warps per block
-  const int warp = threadIdx.x >> 5;          // 0..wpb-1
-  const int lane = threadIdx.x & 31;          // 0..31
-  const int c    = blockIdx.z * wpb + warp;   // class id
-  if (j >= k || era >= E || c >= K) return;
-
-  extern __shared__ float sm[];
-  const int stride = (B + pad);
-  float* sG = sm;                              // [wpb * (B+pad)]
-  float* sH = sm + (size_t)wpb * stride;       // [wpb * (B+pad)]
-
-  // zero this warp's row
-  for (int b = lane; b < B; b += 32) {
-    sG[warp * stride + b] = 0.f;
-    sH[warp * stride + b] = 0.f;
-  }
-  __syncthreads();
-
-  const int f = feat_idx[j];
-  const int32_t* off = off_era + (size_t)c * (size_t)(E + 1);
-  const int start = off[era];
-  const int end   = off[era + 1];
-
-  // stride the contiguous era segment, lane-strided
-  for (int m = start + lane; m < end; m += 32) {
-    const int n   = idx_out[(size_t)c * (size_t)Mmax + m];
-    const int bin = (int)(uint8_t)bin_idx[(size_t)n * (size_t)F + f];
-    const float g = G[(size_t)n * (size_t)K + c];
-    const float h = H[(size_t)n * (size_t)K + c];
-
-    // warp-aggregated updates by 'bin' (era is fixed in this block)
-    unsigned full   = __activemask();
-    unsigned peers  = __match_any_sync(full, bin);
-    const int leader= __ffs(peers) - 1;
-    const float g_sum = warp_sum_mask(peers, g);
-    const float h_sum = warp_sum_mask(peers, h);
-
-    if (lane == leader) {
-      atomicAdd(&sG[warp * stride + bin], g_sum);
-      atomicAdd(&sH[warp * stride + bin], h_sum);
-    }
-  }
-  __syncthreads();
-
-  // Flush to global [E,k,K,B] (each warp writes disjoint class slice)
-  const size_t base = ((((size_t)era * (size_t)k) + (size_t)j) * (size_t)K + (size_t)c) * (size_t)B;
-  for (int b = lane; b < B; b += 32) {
-    GH[base + b] = sG[warp * stride + b];
-    HH[base + b] = sH[warp * stride + b];
-  }
-}
-
-// ==========================
-// 3) Public orchestrator
-// ==========================
-// API:
-//   h_des_mc(bin_idx[N,F]int8, era_of_row[N]int32, G[N,K]f32, H[N,K]f32,
-//            feat_idx[k]int32, idx_mat[K,Mmax]int32, idx_len[K]int32,
-//            era_ends[E]int32 (exclusive ends for root fast-path),
-//            B, enable_compact, root_fastpath) -> [2,E,k,K,B]
-
-torch::Tensor h_des_mc(
-    torch::Tensor bin_idx,
-    torch::Tensor era_of_row,
-    torch::Tensor G,
-    torch::Tensor H,
-    torch::Tensor feat_idx,
-    torch::Tensor idx_mat,
-    torch::Tensor idx_len,
-    torch::Tensor era_ends,
-    int B,
-    bool enable_compact,
-    bool root_fastpath)
-{
-  TORCH_CHECK(bin_idx.is_cuda() && era_of_row.is_cuda() && G.is_cuda() && H.is_cuda()
-           && feat_idx.is_cuda() && idx_mat.is_cuda() && idx_len.is_cuda(),
-           "All tensors must be CUDA.");
-  TORCH_CHECK(bin_idx.scalar_type() == torch::kInt8,    "bin_idx must be int8.");
-  TORCH_CHECK(era_of_row.scalar_type() == torch::kInt32,"era_of_row must be int32.");
-  TORCH_CHECK(G.scalar_type() == torch::kFloat && H.scalar_type() == torch::kFloat,
-              "G and H must be float32.");
-  TORCH_CHECK(feat_idx.scalar_type() == torch::kInt32,  "feat_idx must be int32.");
-  TORCH_CHECK(idx_mat.scalar_type() == torch::kInt32 && idx_len.scalar_type() == torch::kInt32,
-              "idx_mat/idx_len must be int32.");
-  TORCH_CHECK(era_ends.scalar_type() == torch::kInt32,  "era_ends must be int32.");
-
-  TORCH_CHECK(bin_idx.dim()==2, "bin_idx [N,F]");
-  TORCH_CHECK(G.dim()==2 && H.dim()==2 && G.sizes()==H.sizes(), "G/H [N,K] and same shape");
-  TORCH_CHECK(feat_idx.dim()==1, "feat_idx [k]");
-  TORCH_CHECK(idx_mat.dim()==2 && idx_len.dim()==1, "idx_mat [K,Mmax], idx_len [K]");
-  TORCH_CHECK(era_ends.dim()==1, "era_ends [E]");
-
-  const int N = (int)bin_idx.size(0);
-  const int F = (int)bin_idx.size(1);
-  const int K = (int)G.size(1);
-  const int k = (int)feat_idx.size(0);
-  const int Mmax = (int)idx_mat.size(1);
-  const int E = (int)era_ends.size(0);
-
-  TORCH_CHECK(G.size(0) == N && H.size(0) == N, "G/H N mismatch with bin_idx");
-  TORCH_CHECK(idx_mat.size(0) == K && idx_len.size(0) == K, "idx_* K mismatch");
-
-  // Output tensors
-  auto GH = torch::zeros({ (long long)E, (long long)k, (long long)K, (long long)B }, G.options());
-  auto HH = torch::zeros_like(GH);
-
-  // Shared-memory sizing & block shape for histogram
+  // Device properties
   auto* prop = at::cuda::getCurrentDeviceProperties();
+  const int maxThreadsPerBlock = prop->maxThreadsPerBlock;
   size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
                                                  : (size_t)prop->sharedMemPerBlock;
-  const int PAD = 1; // bank-conflict padding per row
-  const int wpb = choose_warps_per_block(smem_cap, B, PAD);
-  const size_t smem_hist = 2ull * (size_t)wpb * (size_t)(B + PAD) * sizeof(float);
+
+  // Auto-tune tile size and threads
+  const size_t bytes_per_class = (size_t)E * (size_t)B * 2 * sizeof(float);
+  int tile_by_smem = (bytes_per_class == 0) ? 1 : (int)(smem_cap / bytes_per_class);
+  if (tile_by_smem < 1) tile_by_smem = 0; // signals "use global" path
+
+  int tile_by_threads = maxThreadsPerBlock / WARP; // 1 warp per class
+  if (tile_by_threads < 1) tile_by_threads = 1;
+
+  int K_tile = (K_tile_hint > 0) ? std::min({K_tile_hint, K_total, tile_by_threads})
+                                 : std::min({8, K_total, tile_by_threads}); // 8 warps default
+
+  bool use_shared = (tile_by_smem >= 1);
+  if (use_shared) {
+    K_tile = std::min(K_tile, tile_by_smem);
+  } else {
+    // shared mem can’t hold [E,B] per class → fall back to global atomics
+    K_tile = std::min(K_tile, K_total);
+  }
+  if (K_tile < 1) K_tile = 1;
+
+  int threads_per_block = (threads_per_block_hint > 0)
+      ? threads_per_block_hint
+      : (K_tile * WARP); // one warp per class
+  // Cap by device limit & keep multiple of 32
+  threads_per_block = std::min(threads_per_block, (maxThreadsPerBlock / WARP) * WARP);
+  if (threads_per_block < WARP) threads_per_block = WARP;
+
+  const int blocks_y = ceil_div_int(K_total, K_tile);
+  dim3 grid((unsigned)k, (unsigned)blocks_y, 1u);
+  dim3 block((unsigned)threads_per_block, 1u, 1u);
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  // Heuristic: compact when many rows and multiple eras
-  const int total_len = (int)idx_len.sum().item<int64_t>();
-  const bool do_compact = enable_compact && (E > 1) && (total_len >= 2048);
+  if (use_shared) {
+    const size_t smem_bytes = (size_t)K_tile * bytes_per_class;
+    // Opt-in for dynamic shared memory on recent architectures
+    cudaFuncSetAttribute(_h_des_mc_smem, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
 
-  if (root_fastpath && E > 1) {
-    // Root fast-path: eras sorted; fabricate off_era from era_ends and identity idx_out
-    auto off_era = torch::empty({ K, E + 1 }, idx_len.options());
-    {
-      // Build on CPU (E is small), then move to device
-      auto off_cpu  = off_era.cpu();
-      auto ends_cpu = era_ends.cpu();
-      for (int c = 0; c < K; ++c) {
-        off_cpu.data_ptr<int32_t>()[ (size_t)c*(E+1) + 0 ] = 0;
-        for (int e = 0; e < E; ++e)
-          off_cpu.data_ptr<int32_t>()[ (size_t)c*(E+1) + (e+1) ] = ends_cpu.data_ptr<int32_t>()[e];
-      }
-      off_era = off_cpu.to(bin_idx.device(), /*non_blocking=*/true);
-    }
-    // Identity idx_out per class (NOTE: for very large K*N you may want an implicit-index kernel variant)
-    auto idx_row = torch::arange(N, torch::dtype(torch::kInt32).device(bin_idx.device()));
-    auto idx_out = idx_row.unsqueeze(0).expand({ K, N }).contiguous();
-
-    dim3 grid(k, E, ceil_div_int(K, wpb));
-    dim3 blk(32 * wpb, 1, 1);
-    cudaFuncSetAttribute(_h_des_mc_bfly, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_hist);
-    _h_des_mc_bfly<<<grid, blk, smem_hist, stream.stream()>>>(
-      bin_idx.data_ptr<int8_t>(),
-      G.data_ptr<float>(), H.data_ptr<float>(),
+    _h_des_mc_smem<<<grid, block, smem_bytes, stream.stream()>>>(
+      bin_indices.data_ptr<int8_t>(),
+      grads.data_ptr<float>(),
+      hess.data_ptr<float>(),
+      idx_mat.data_ptr<int32_t>(),
+      idx_len.data_ptr<int32_t>(),
       feat_idx.data_ptr<int32_t>(),
-      idx_out.data_ptr<int32_t>(),
-      off_era.data_ptr<int32_t>(),
-      GH.data_ptr<float>(), HH.data_ptr<float>(),
-      N, F, K, E, k, B, /*Mmax=*/N, PAD);
-  }
-  else if (do_compact) {
-    // One-pass compaction (butterfly), then tiny scan, then histogram
-    const int threads = 256;
-    const int rpt = 2; // rows_per_thread (tune 2 or 4)
-    const int rows_per_block = threads * rpt;
-    const int max_len = (int)idx_len.max().item<int64_t>();
-    const int tiles_y = max(1, ceil_div_int(max_len, rows_per_block));
-
-    auto heads   = torch::zeros({ K, E }, idx_len.options()); // will hold counts
-    auto idx_out = torch::empty({ K, Mmax }, idx_mat.options());
-
-    // (1) compaction
-    {
-      dim3 grid_c(K, tiles_y, 1);
-      _et_compact_bfly_onepass<<<grid_c, threads, 0, stream.stream()>>>(
-        idx_mat.data_ptr<int32_t>(), idx_len.data_ptr<int32_t>(),
-        era_of_row.data_ptr<int32_t>(),
-        K, Mmax, E,
-        heads.data_ptr<int32_t>(),
-        idx_out.data_ptr<int32_t>(),
-        rpt);
-    }
-
-    // (2) scan heads -> off_era
-    auto off_era = torch::empty({ K, E + 1 }, idx_len.options());
-    {
-      dim3 grid_s(K, 1, 1);
-      _scan_counts_to_offsets<<<grid_s, 1, 0, stream.stream()>>>(
-        heads.data_ptr<int32_t>(), K, E,
-        off_era.data_ptr<int32_t>());
-    }
-
-    // (3) histogram
-    {
-      dim3 grid_h(k, E, ceil_div_int(K, wpb));
-      dim3 blk_h(32 * wpb, 1, 1);
-      cudaFuncSetAttribute(_h_des_mc_bfly, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_hist);
-      _h_des_mc_bfly<<<grid_h, blk_h, smem_hist, stream.stream()>>>(
-        bin_idx.data_ptr<int8_t>(),
-        G.data_ptr<float>(), H.data_ptr<float>(),
-        feat_idx.data_ptr<int32_t>(),
-        idx_out.data_ptr<int32_t>(),
-        off_era.data_ptr<int32_t>(),
-        GH.data_ptr<float>(), HH.data_ptr<float>(),
-        N, F, K, E, k, B, Mmax, PAD);
-    }
-  }
-  else {
-    // Small node / single era fallback: fabricate trivial off_era per class and reuse idx_mat
-    auto off_era = torch::empty({ K, E + 1 }, idx_len.options());
-    {
-      auto off_cpu = off_era.cpu();
-      if (E == 1) {
-        for (int c = 0; c < K; ++c) {
-          off_cpu.data_ptr<int32_t>()[ (size_t)c*2 + 0 ] = 0;
-          off_cpu.data_ptr<int32_t>()[ (size_t)c*2 + 1 ] = idx_len.cpu().data_ptr<int32_t>()[c];
-        }
-      } else {
-        // If multiple eras but tiny node, approximate by using era_ends (safe if idx_mat built from current node)
-        auto ends_cpu = era_ends.cpu();
-        for (int c = 0; c < K; ++c) {
-          off_cpu.data_ptr<int32_t>()[ (size_t)c*(E+1) + 0 ] = 0;
-          for (int e = 0; e < E; ++e)
-            off_cpu.data_ptr<int32_t>()[ (size_t)c*(E+1) + (e+1) ] = ends_cpu.data_ptr<int32_t>()[e];
-        }
-      }
-      off_era = off_cpu.to(bin_idx.device(), /*non_blocking=*/true);
-    }
-
-    auto idx_out = idx_mat; // already (ragged) but ranges are small; acceptable
-
-    dim3 grid(k, E, ceil_div_int(K, wpb));
-    dim3 blk(32 * wpb, 1, 1);
-    cudaFuncSetAttribute(_h_des_mc_bfly, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_hist);
-    _h_des_mc_bfly<<<grid, blk, smem_hist, stream.stream()>>>(
-      bin_idx.data_ptr<int8_t>(),
-      G.data_ptr<float>(), H.data_ptr<float>(),
+      era_indices.data_ptr<int32_t>(),
+      GH.data_ptr<float>(),
+      HH.data_ptr<float>(),
+      N, F_master, K_total, k, B, E, Mmax, K_tile
+    );
+  } else {
+    // Global-atomic fallback, no dynamic shared memory
+    _h_des_mc_global<<<grid, block, 0, stream.stream()>>>(
+      bin_indices.data_ptr<int8_t>(),
+      grads.data_ptr<float>(),
+      hess.data_ptr<float>(),
+      idx_mat.data_ptr<int32_t>(),
+      idx_len.data_ptr<int32_t>(),
       feat_idx.data_ptr<int32_t>(),
-      idx_out.data_ptr<int32_t>(),
-      off_era.data_ptr<int32_t>(),
-      GH.data_ptr<float>(), HH.data_ptr<float>(),
-      N, F, K, E, k, B, Mmax, PAD);
+      era_indices.data_ptr<int32_t>(),
+      GH.data_ptr<float>(),
+      HH.data_ptr<float>(),
+      N, F_master, K_total, k, B, E, Mmax, K_tile
+    );
   }
 
   TORCH_CHECK(cudaGetLastError() == cudaSuccess,
-              "h_des_mc launch failed: ", cudaGetErrorString(cudaGetLastError()));
+              "h_des_mc launch failed: ",
+              cudaGetErrorString(cudaGetLastError()));
 
-  return torch::stack({ GH, HH }, 0); // [2, E, k, K, B]
+  return {GH, HH};
 }

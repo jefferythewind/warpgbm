@@ -547,57 +547,78 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _pack_idx_mat(self, node_idx_by_class):
         """
-        node_idx_by_class: list[Tensor[int32]] length K; each tensor is 1-D indices into [0..N-1]
+        node_idx_by_class: list[Tensor[int32 or int64]] length K; each 1-D GPU tensor of row ids (any order).
         Returns:
-        idx_mat: [K, Mmax] int32 (padded, undefined past len)
-        idx_len: [K] int32
-        Mmax: int
+        idx_mat: [K, Mmax] int32 (CUDA)  (padding garbage is fine; kernel uses idx_len)
+        idx_len: [K] int32 (CUDA)
+        Mmax:    int
         """
         K = len(node_idx_by_class)
-        lens = torch.tensor([int(x.numel()) for x in node_idx_by_class],
-                            device=self.device, dtype=torch.int32)
-        Mmax = int(lens.max().item()) if K > 0 else 0
+        if K == 0:
+            idx_mat = torch.empty((0, 1), device=self.device, dtype=torch.int32)
+            idx_len = torch.zeros(0, device=self.device, dtype=torch.int32)
+            return idx_mat, idx_len, 1
+
+        # lengths + max
+        lens_host = [int(x.numel()) for x in node_idx_by_class]
+        Mmax = max(lens_host) if lens_host else 1
         if Mmax == 0:
-            # Avoid empty allocations that confuse the launcher
             Mmax = 1
+
         idx_mat = torch.empty((K, Mmax), device=self.device, dtype=torch.int32)
+        idx_len = torch.empty((K,), device=self.device, dtype=torch.int32)
+
         for c, idx in enumerate(node_idx_by_class):
-            L = int(lens[c].item())
+            if idx.device.type != "cuda":
+                idx = idx.to(self.device)
+            if idx.dtype != torch.int32:
+                idx = idx.to(torch.int32)
+            # ensure ascending for better mem locality (important!)
+            if idx.numel() > 1:
+                idx, _ = torch.sort(idx)
+            L = idx.numel()
             if L > 0:
-                idx_mat[c, :L] = idx.to(torch.int32)
-        return idx_mat, lens, Mmax
+                idx_mat[c, :L] = idx
+            idx_len[c] = L
+
+        return idx_mat.contiguous(), idx_len.contiguous(), Mmax
+
 
     def _mc_hist_batched_for_node(self, node_idx_by_class, feat_idx, grads, hess, depth):
         """
-        Compute per-era, per-feature, per-class hist for THIS node.
-        Returns GH, HH shaped [E, k, K, B].
+        Compute per-era, per-feature, per-class hist for THIS node using the new h_des_mc kernel.
+        Returns GH, HH shaped [E, k, K, B] (float32).
         """
         K = len(node_idx_by_class)
         k = int(feat_idx.numel())
         if K == 0 or k == 0:
             E = int(self.era_indices.max().item()) + 1
-            z = torch.zeros((E, k, 0, self.num_bins), device=self.device)
+            z = torch.zeros((E, k, 0, self.num_bins), device=self.device, dtype=torch.float32)
             return z, z
 
+        # Pack per-class membership (sorted) -> [K, Mmax], [K]
         idx_mat, idx_len, _ = self._pack_idx_mat(node_idx_by_class)
 
-        era_ends = self._era_ends
-        enable_compact = True
-        root_fastpath = (depth == 0)
-
-        stacked = node_kernel.h_des_mc(
-            self.bin_indices,                     # no dtype/device copy
-            self.era_indices,                     # no dtype/device copy
-            grads.contiguous().to(torch.float32),
-            hess.contiguous().to(torch.float32),
-            feat_idx.to(torch.int32),
-            idx_mat, idx_len, era_ends,
-            int(self.num_bins),
-            bool(enable_compact),
-            bool(root_fastpath)
+        # Kernel expects:
+        #   bin_indices[N,F], grads[N,K], hess[N,K], idx_mat[K,Mmax], idx_len[K],
+        #   feat_idx[k], era_indices[N], num_bins, K_tile_hint, threads_per_block_hint
+        # We can let it autotune: pass 0, 0 for the two hints.
+        GH, HH = node_kernel.h_des_mc(
+            self.bin_indices,                          # [N, F] int8 (cuda)
+            grads.contiguous().to(torch.float32),      # [N, K]
+            hess.contiguous().to(torch.float32),       # [N, K]
+            idx_mat,                                   # [K, Mmax] int32
+            idx_len,                                   # [K] int32
+            feat_idx.to(torch.int32),                  # [k] int32
+            self.era_indices.to(torch.int32),          # [N] int32
+            int(self.num_bins),                        # B
+            0,                                         # K_tile_hint (0 => auto)
+            0,                                         # threads_per_block_hint (0 => auto)
         )
-        GH, HH = stacked[0], stacked[1]  # [E, k, K, B]
+
+        # Shapes: GH,HH -> [E, k, K, B]
         return GH, HH
+
 
 
     def _partition_one_class(self, idx: torch.Tensor, global_feat: int, split_bin: int):
