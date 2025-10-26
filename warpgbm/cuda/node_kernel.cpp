@@ -42,14 +42,14 @@ void predict_with_forest(
     at::Tensor &out // [N], float32
 );
 
-std::vector<Tensor> h_des_mc(
-    Tensor bin_indices,   // [N, F_master] int8
-    Tensor grads,         // [N, K] float32
-    Tensor hess,          // [N, K] float32
-    Tensor idx_mat,       // [K, Mmax] int32
-    Tensor idx_len,       // [K] int32
-    Tensor feat_idx,      // [k] int32
-    Tensor era_indices,   // [N] int32
+std::vector<torch::Tensor> h_des_mc(
+    torch::Tensor bin_indices,   // [N, F_master] int8
+    torch::Tensor grads,         // [N, K] float32
+    torch::Tensor hess,          // [N, K] float32
+    torch::Tensor idx_mat,       // [K, Mmax] int32
+    torch::Tensor idx_len,       // [K] int32
+    torch::Tensor feat_idx,      // [k] int32
+    torch::Tensor era_indices,   // [N] int32
     int num_bins,         // B
     int K_tile_hint,
     int threads_per_block_hint

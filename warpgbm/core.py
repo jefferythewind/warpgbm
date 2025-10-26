@@ -584,40 +584,69 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return idx_mat.contiguous(), idx_len.contiguous(), Mmax
 
 
-    def _mc_hist_batched_for_node(self, node_idx_by_class, feat_idx, grads, hess, depth):
+    def _mc_hist_batched_for_node(
+        self,
+        *,
+        feat_idx: torch.Tensor,           # [k] int32
+        grads_view: torch.Tensor,         # [N, G] float32   (columns aligned to idx_mat rows)
+        hess_view: torch.Tensor,          # [N, G] float32   (counts or real hess)
+        idx_mat: torch.Tensor,            # [G, Mmax] int32
+        idx_len: torch.Tensor,            # [G] int32
+        k_tile_hint: int = 0,
+        threads_per_block_hint: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute per-era, per-feature, per-class hist for THIS node using the new h_des_mc kernel.
-        Returns GH, HH shaped [E, k, K, B] (float32).
+        Batched per-era histograms for G groups (classes or child subsets).
+
+        Returns:
+            GH, HH with shape [E, k, G, B] (float32, contiguous)
         """
-        K = len(node_idx_by_class)
-        k = int(feat_idx.numel())
-        if K == 0 or k == 0:
-            E = int(self.era_indices.max().item()) + 1
-            z = torch.zeros((E, k, 0, self.num_bins), device=self.device, dtype=torch.float32)
-            return z, z
+        assert grads_view.is_cuda and hess_view.is_cuda
+        assert idx_mat.is_cuda and idx_len.is_cuda
+        assert self.bin_indices.is_cuda and self.era_indices.is_cuda
 
-        # Pack per-class membership (sorted) -> [K, Mmax], [K]
-        idx_mat, idx_len, _ = self._pack_idx_mat(node_idx_by_class)
-
-        # Kernel expects:
-        #   bin_indices[N,F], grads[N,K], hess[N,K], idx_mat[K,Mmax], idx_len[K],
-        #   feat_idx[k], era_indices[N], num_bins, K_tile_hint, threads_per_block_hint
-        # We can let it autotune: pass 0, 0 for the two hints.
+        # Shapes/Dtypes expected by the launcher
+        # bin_indices: [N,F] int8
+        # grads/hess : [N,G] float32
+        # idx_mat    : [G,Mmax] int32
+        # idx_len    : [G] int32
+        # feat_idx   : [k] int32
+        # era_indices: [N] int32
+        # num_bins   : int
         GH, HH = node_kernel.h_des_mc(
-            self.bin_indices,                          # [N, F] int8 (cuda)
-            grads.contiguous().to(torch.float32),      # [N, K]
-            hess.contiguous().to(torch.float32),       # [N, K]
-            idx_mat,                                   # [K, Mmax] int32
-            idx_len,                                   # [K] int32
-            feat_idx.to(torch.int32),                  # [k] int32
-            self.era_indices.to(torch.int32),          # [N] int32
-            int(self.num_bins),                        # B
-            0,                                         # K_tile_hint (0 => auto)
-            0,                                         # threads_per_block_hint (0 => auto)
+            self.bin_indices,                              # [N,F] int8
+            grads_view.contiguous().to(torch.float32),     # [N,G] f32
+            hess_view.contiguous().to(torch.float32),      # [N,G] f32
+            idx_mat.contiguous().to(torch.int32),          # [G,Mmax] i32
+            idx_len.contiguous().to(torch.int32),          # [G] i32
+            feat_idx.contiguous().to(torch.int32),         # [k] i32
+            self.era_indices.contiguous().to(torch.int32), # [N] i32
+            int(self.num_bins),
+            int(k_tile_hint),
+            int(threads_per_block_hint),
         )
-
-        # Shapes: GH,HH -> [E, k, K, B]
+        # Expect [E, k, G, B]
         return GH, HH
+
+
+    def _get_split_scratch(self, k_cur: int):
+        need_new = (
+            not hasattr(self, "_scratch_gain") or
+            self._scratch_gain is None or
+            self._scratch_gain.shape[1] != k_cur
+        )
+        if need_new:
+            self._scratch_gain = torch.zeros(
+                self.num_eras, k_cur, self.num_bins - 1,
+                device=self.device, dtype=torch.float32
+            )
+            self._scratch_dir = torch.zeros_like(self._scratch_gain)
+        else:
+            self._scratch_gain.zero_()
+            self._scratch_dir.zero_()
+        return self._scratch_gain, self._scratch_dir
+
+
 
 
 
@@ -752,130 +781,287 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     # --- NEW: per-class recursive grow, using batched hist at each node when convenient ---
 
+    def _pack_idx_list(self, groups: list[torch.Tensor]):
+        """
+        groups: list of index tensors (int32 cuda), length G
+        Returns: (idx_mat [G,Mmax] i32, idx_len [G] i32, owners_idx: Long[ G ])
+        """
+        if not groups:
+            # Create a harmless 1x1 stub to keep the launcher happy
+            stub = torch.zeros((1, 1), device=self.device, dtype=torch.int32)
+            return stub, torch.zeros(1, device=self.device, dtype=torch.int32)
+
+        lens = torch.tensor([int(g.numel()) for g in groups], device=self.device, dtype=torch.int32)
+        Mmax = int(max(1, int(lens.max().item())))
+        mat = torch.empty((len(groups), Mmax), device=self.device, dtype=torch.int32)
+        for i, g in enumerate(groups):
+            L = int(lens[i].item())
+            if L > 0:
+                mat[i, :L] = g.to(torch.int32)
+        return mat, lens
+
+
     def _grow_tree_multiclass_round(
         self,
-        grads: torch.Tensor,        # [N, K], negative gradient (we pass -grads into hist)
-        hess: torch.Tensor,         # [N, K]
-        feat_idx: torch.Tensor,     # [k] int32 feature subset for this round
-        node_idx_by_class,          # list[Tensor[int32]] length K for this node
-        depth: int
+        grads: torch.Tensor,        # [N, K], (we'll pass -grads into the hist builder)
+        hess: torch.Tensor,         # [N, K], (counts or real hess)
+        feat_idx: torch.Tensor,     # [k] int32
+        node_idx_by_class,          # list[Tensor[int32]] length K
+        depth: int,
+        seed_hist_by_class: dict | None = None,  # optional: {c: (GH_seed[E,k,B], HH_seed[E,k,B])}
     ):
         """
-        Returns:
-        trees_k: list[dict] length K (one tree per class)
-        Mutates:
-        self.gradients[:, c] += lr * leaf_value at leaves (same behavior as your code)
-        self.per_era_feature_importance_ accumulates per split
+        Returns list[dict] length K (one tree per class), and updates self.gradients in-place.
+        Uses batched parent build, batched small-child build, and subtraction for big child,
+        and threads child histogram seeds down the recursion to avoid recomputation.
         """
+        device = self.device
         K = len(node_idx_by_class)
-        # Base case check: if max depth reached → leaf for any class with samples
-        if depth == self.max_depth:
-            trees = []
-            for c in range(K):
-                idx = node_idx_by_class[c]
-                if idx.numel() == 0:
-                    trees.append({"leaf_value": 0.0, "samples": 0})  # nothing to do
-                    continue
-                # leaf value is mean residual for this class/node
-                leaf_val = (-grads[idx, c]).mean()
-                self.gradients[idx, c] += self.learning_rate * leaf_val
-                trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
-            return trees
-
-        # Compute histograms for all classes at once (root uses fast-path)
-        GH, HH = self._mc_hist_batched_for_node(
-            node_idx_by_class=node_idx_by_class,
-            feat_idx=feat_idx,
-            grads=-grads,            # hist expects residuals; residual = -grad
-            hess=hess,
-            depth=depth
-        )  # [E, k, K, B]
-
         k = int(feat_idx.numel())
-        # Prepare containers
-        best_local_feat = [-1] * K
-        best_bin = [-1] * K
-        do_split = [False] * K
+        empty_idx = torch.empty(0, dtype=torch.int32, device=device)
 
-        # Evaluate best split PER CLASS with your existing compute_split → find_best_split
-        # Pre-allocate per-era work buffers to match k for this level
-        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins - 1,
-                                        device=self.device, dtype=torch.float32)
-        self.per_era_direction = torch.zeros_like(self.per_era_gain)
-
-        for c in range(K):
-            idx = node_idx_by_class[c]
-            if idx.numel() == 0:
-                continue  # dead branch for this class
-            grad_hist_c = GH[:, :, c, :]    # [E,k,B]
-            hess_hist_c = HH[:, :, c, :]    # [E,k,B]
-            lf, lb = self.find_best_split(grad_hist_c, hess_hist_c)  # uses self.per_era_gain/_direction
-            best_local_feat[c] = lf
-            best_bin[c] = lb
-            do_split[c] = (lf != -1)
-
-            # Accumulate per-era feature importances for chosen split (match your grow_tree code)
-            if do_split[c]:
-                global_f = int(feat_idx[lf].item())
-                per_era_gains = self.per_era_gain[:, lf, lb]  # [E]
-                for era_idx in range(self.num_eras):
-                    self.per_era_feature_importance_[era_idx, global_f] += float(per_era_gains[era_idx].item())
-
-        # If nobody can split → make leaves
-        if not any(do_split):
+        # ── Base case: make leaves ──
+        if depth == self.max_depth or k == 0:
             trees = []
             for c in range(K):
                 idx = node_idx_by_class[c]
                 if idx.numel() == 0:
                     trees.append({"leaf_value": 0.0, "samples": 0})
-                    continue
-                leaf_val = (-grads[idx, c]).mean()
-                self.gradients[idx, c] += self.learning_rate * leaf_val
-                trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
+                else:
+                    leaf_val = (-grads[idx, c]).mean()
+                    self.gradients[idx, c] += self.learning_rate * leaf_val
+                    trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
             return trees
 
-        # Partition per class and recurse (per-class recursion for clarity/stability)
-        left_children = [None] * K
-        right_children = [None] * K
-        trees = []
+        # ── Build/collect parent histograms, batched across classes ──
+        # Parent GH/HH have shape [E, k, K, B]
+        if seed_hist_by_class:
+            # Assemble a full [E,k,K,B] GH/HH from provided seeds; missing classes will be built
+            need_build = []
+            GH_parent = torch.zeros((self.num_eras, k, K, self.num_bins),
+                                    device=device, dtype=torch.float32)
+            HH_parent = torch.zeros_like(GH_parent)
+            for c in range(K):
+                if node_idx_by_class[c].numel() == 0:
+                    continue
+                seed = seed_hist_by_class.get(c, None)
+                if seed is None:
+                    need_build.append(c)
+                else:
+                    GH_parent[:, :, c, :] = seed[0]
+                    HH_parent[:, :, c, :] = seed[1]
+
+            if need_build:
+                # Build only the missing classes in a single batched call
+                idx_list = [node_idx_by_class[c] for c in need_build]
+                
+                # FIX: Pack indices and select grad/hess columns
+                idx_mat, idx_len, _ = self._pack_idx_mat(idx_list)
+                sel_c = torch.tensor(need_build, device=device, dtype=torch.long)
+                grads_view = -grads.index_select(1, sel_c)
+                hess_view = hess.index_select(1, sel_c)
+
+                GH_miss, HH_miss = self._mc_hist_batched_for_node(
+                    feat_idx=feat_idx,
+                    grads_view=grads_view,
+                    hess_view=hess_view,
+                    idx_mat=idx_mat,
+                    idx_len=idx_len
+                )  # [E,k,|need_build|,B]
+                
+                # Scatter them back into the K dimension
+                GH_parent.index_copy_(2, sel_c, GH_miss)
+                HH_parent.index_copy_(2, sel_c, HH_miss)
+        else:
+            # No seeds: build everything in one shot
+            # FIX: Pack indices
+            idx_mat, idx_len, _ = self._pack_idx_mat(node_idx_by_class)
+            
+            GH_parent, HH_parent = self._mc_hist_batched_for_node(
+                feat_idx=feat_idx,
+                grads_view=-grads, # Use all K columns
+                hess_view=hess,    # Use all K columns
+                idx_mat=idx_mat,
+                idx_len=idx_len
+            )  # [E,k,K,B]
+
+        # ── Pick best split per class ──
+        best_local_feat = [-1] * K
+        best_bin = [-1] * K
+        can_split = [False] * K
+
+        # Reuse per-era buffers (shapes depend on k at this level)
+        # Note: self._get_split_scratch(k) helper could also be used here
+        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins - 1,
+                                        device=device, dtype=torch.float32)
+        self.per_era_direction = torch.zeros_like(self.per_era_gain)
 
         for c in range(K):
             idx = node_idx_by_class[c]
-            if idx.numel() == 0:
-                trees.append({"leaf_value": 0.0, "samples": 0})
+            # Must have min_child_weight * 2 samples to split
+            if idx.numel() < (self.min_child_weight * 2):
                 continue
+            
+            GHc = GH_parent[:, :, c, :]  # [E,k,B]
+            HHc = HH_parent[:, :, c, :]
+            
+            lf, lb = self.find_best_split(GHc, HHc)
+            best_local_feat[c] = lf
+            best_bin[c] = lb
+            can_split[c] = (lf != -1)
 
-            if not do_split[c]:
-                # Become leaf
-                leaf_val = (-grads[idx, c]).mean()
-                self.gradients[idx, c] += self.learning_rate * leaf_val
-                trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
-                continue
+            if can_split[c]:
+                global_f = int(feat_idx[lf].item())
+                per_era_gains = self.per_era_gain[:, lf, lb]  # [E]
+                # feature importance accumulation
+                for e in range(self.num_eras):
+                    self.per_era_feature_importance_[e, global_f] += float(per_era_gains[e].item())
 
+        if not any(can_split):
+            # Turn this node into leaves
+            trees = []
+            for c in range(K):
+                idx = node_idx_by_class[c]
+                if idx.numel() == 0:
+                    trees.append({"leaf_value": 0.0, "samples": 0})
+                else:
+                    leaf_val = (-grads[idx, c]).mean()
+                    self.gradients[idx, c] += self.learning_rate * leaf_val
+                    trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
+            return trees
+
+        # ── Decide small-vs-big per class using HH totals ──
+        active_classes = [c for c in range(K) if can_split[c]]
+        small_is_left = {}
+        left_sizes = {}
+        right_sizes = {}
+        
+        for c in active_classes:
+            lf = best_local_feat[c]
+            lb = best_bin[c]
+            # Use total counts (sum over eras, features, bins)
+            HHc_feat = HH_parent[:, lf, c, :]           # [E, B]
+            total = HHc_feat.sum()
+            left_cnt = HHc_feat[:, : (lb + 1)].sum()
+            right_cnt = total - left_cnt
+            
+            left_sizes[c] = left_cnt
+            right_sizes[c] = right_cnt
+            small_is_left[c] = (left_cnt <= right_cnt)
+            
+            # Check min_child_weight
+            if (left_cnt < self.min_child_weight) or (right_cnt < self.min_child_weight):
+                can_split[c] = False # Invalidate split
+
+        # Re-filter active classes based on min_child_weight
+        active_classes = [c for c in active_classes if can_split[c]]
+
+        # ── Partition sample indices per class ──
+        left_idx_by_c, right_idx_by_c = {}, {}
+        for c in active_classes:
             gl_f = int(feat_idx[best_local_feat[c]].item())
             lb = int(best_bin[c])
+            idx = node_idx_by_class[c]
+            L, R = self._partition_one_class(idx, gl_f, lb)
+            left_idx_by_c[c] = L
+            right_idx_by_c[c] = R
 
-            left_idx, right_idx = self._partition_one_class(idx, gl_f, lb)
+        # ── Build small-child histograms in one batched call (depth+1) ──
+        small_classes = active_classes # Use the filtered list
+        small_lists = [
+            (left_idx_by_c[c] if small_is_left[c] else right_idx_by_c[c])
+            for c in small_classes
+        ]
+        
+        if small_lists:
+            # FIX: Pack indices and select grad/hess columns
+            idx_mat_small, idx_len_small, _ = self._pack_idx_mat(small_lists)
+            sel_c_small = torch.tensor(small_classes, device=device, dtype=torch.long)
+            grads_view_small = -grads.index_select(1, sel_c_small)
+            hess_view_small = hess.index_select(1, sel_c_small)
 
-            # Recurse for this class only: still pass lists of length K so shapes align,
-            # but keep other classes' lists empty so they quickly return leaf_value=0.
-            next_node_idx_by_class = [torch.empty(0, dtype=torch.int32, device=self.device) for _ in range(K)]
-            next_node_idx_by_class[c] = left_idx
-            left_child_list = self._grow_tree_multiclass_round(grads, hess, feat_idx, next_node_idx_by_class, depth + 1)
-            next_node_idx_by_class[c] = right_idx
-            right_child_list = self._grow_tree_multiclass_round(grads, hess, feat_idx, next_node_idx_by_class, depth + 1)
+            GH_small, HH_small = self._mc_hist_batched_for_node(
+                feat_idx=feat_idx,
+                grads_view=grads_view_small,
+                hess_view=hess_view_small,
+                idx_mat=idx_mat_small,
+                idx_len=idx_len_small
+            )  # [E,k,|small_classes|,B]
+            
+            # ── Derive big-child hist by subtraction ──
+            sel = torch.tensor(small_classes, device=device, dtype=torch.long)
+            GH_parent_sel = GH_parent.index_select(2, sel)  # copy, shape [E,k,S,B]
+            HH_parent_sel = HH_parent.index_select(2, sel)
+            GH_big = GH_parent_sel.sub_(GH_small)           # in-place on the copy
+            HH_big = HH_parent_sel.sub_(HH_small)
+        else:
+            # No classes were activated, we will make all leaves
+            GH_small, HH_small = None, None
+            GH_big, HH_big = None, None
 
-            left_children[c] = left_child_list[c]
-            right_children[c] = right_child_list[c]
 
-            trees.append({
-                "feature": torch.tensor(gl_f, dtype=torch.float32),  # keep compatible with flatten_tree
-                "bin": int(lb),
-                "left": left_children[c],
-                "right": right_children[c],
-            })
+        # ── PERFORMANCE FIX: Recurse (batched) ──
+        # Prepare inputs for ONE left call and ONE right call
+        left_node_lists_ALL = [left_idx_by_c.get(c, empty_idx) for c in range(K)]
+        right_node_lists_ALL = [right_idx_by_c.get(c, empty_idx) for c in range(K)]
+
+        seed_left_ALL = {}
+        seed_right_ALL = {}
+
+        if GH_small is not None:
+            for j, c in enumerate(small_classes):
+                # Get the pre-computed histograms for this class's children
+                GH_small_c = GH_small[:, :, j, :].contiguous()
+                HH_small_c = HH_small[:, :, j, :].contiguous()
+                GH_big_c   = GH_big[:, :, j, :].contiguous()
+                HH_big_c   = HH_big[:, :, j, :].contiguous()
+
+                if small_is_left[c]:
+                    seed_left_ALL[c] = (GH_small_c, HH_small_c)
+                    seed_right_ALL[c] = (GH_big_c, HH_big_c)
+                else:
+                    seed_left_ALL[c] = (GH_big_c, HH_big_c)
+                    seed_right_ALL[c] = (GH_small_c, HH_small_c)
+        
+        # Make exactly two recursive calls, each handling all K classes for its side
+        all_left_children = self._grow_tree_multiclass_round(
+            grads, hess, feat_idx, left_node_lists_ALL, depth + 1, seed_hist_by_class=seed_left_ALL
+        )
+        all_right_children = self._grow_tree_multiclass_round(
+            grads, hess, feat_idx, right_node_lists_ALL, depth + 1, seed_hist_by_class=seed_right_ALL
+        )
+        
+        # ── Assemble K trees from results ──
+        trees = []
+        for c in range(K):
+            if can_split[c]: # Use the final, filtered split decision
+                # This class was split at this node
+                gl_f = int(feat_idx[best_local_feat[c]].item())
+                lb = int(best_bin[c])
+                trees.append({
+                    "feature": torch.tensor(gl_f, dtype=torch.float32),
+                    "bin": int(lb),
+                    "left": all_left_children[c],  # The result for class c from the left-side recursion
+                    "right": all_right_children[c], # The result for class c from the right-side recursion
+                })
+            else:
+                # This class was not split (no samples or no gain), make it a leaf
+                idx = node_idx_by_class[c]
+                if idx.numel() == 0:
+                    trees.append({"leaf_value": 0.0, "samples": 0})
+                else:
+                    leaf_val = (-grads[idx, c]).mean()
+                    self.gradients[idx, c] += self.learning_rate * leaf_val
+                    trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
 
         return trees
+
+
+
+
+
+
+
 
     
     def get_eval_metric(self, y_true, y_pred):
