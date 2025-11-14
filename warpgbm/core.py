@@ -902,8 +902,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if idx.numel() < (self.min_child_weight * 2):
                 continue
             
-            GHc = GH_parent[:, :, c, :]  # [E,k,B]
-            HHc = HH_parent[:, :, c, :]
+            GHc = GH_parent[:, :, c, :].contiguous()  # [E,k,B]
+            HHc = HH_parent[:, :, c, :].contiguous()
             
             lf, lb = self.find_best_split(GHc, HHc)
             best_local_feat[c] = lf
