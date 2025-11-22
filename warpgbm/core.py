@@ -6,6 +6,7 @@ from sklearn.metrics import mean_squared_log_error
 from sklearn.preprocessing import LabelEncoder
 from warpgbm.cuda import node_kernel
 from warpgbm.metrics import rmsle_torch, softmax, log_loss_torch, accuracy_torch
+from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 from typing import Tuple
 from torch import Tensor
@@ -19,7 +20,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         max_depth=3,
         learning_rate=0.1,
         n_estimators=100,
-        min_child_weight=20,
+        min_child_weight=1e-3, # Changed from 20 to 1e-3 for Newton Hessian support
         min_split_gain=0.0,
         threads_per_block=64,
         rows_per_thread=4,
@@ -92,7 +93,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "num_bins",
             "max_depth",
             "n_estimators",
-            "min_child_weight",
             "threads_per_block",
             "rows_per_thread",
         ]
@@ -101,6 +101,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "min_split_gain",
             "L2_reg",
             "colsample_bytree",
+            "min_child_weight", 
         ]
 
         for param in int_params:
@@ -115,16 +116,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             ):  # Accept ints as valid floats
                 raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
 
-        if not (2 <= kwargs["num_bins"] <= 127):
-            raise ValueError("num_bins must be between 2 and 127 inclusive.")
+        if not (2 <= kwargs["num_bins"] <= 255):
+            raise ValueError("num_bins must be between 2 and 255 inclusive.")
         if kwargs["max_depth"] < 1:
             raise ValueError("max_depth must be at least 1.")
         if not (0.0 < kwargs["learning_rate"] <= 1.0):
             raise ValueError("learning_rate must be in (0.0, 1.0].")
         if kwargs["n_estimators"] <= 0:
             raise ValueError("n_estimators must be positive.")
-        if kwargs["min_child_weight"] < 1:
-            raise ValueError("min_child_weight must be a positive integer.")
+        if kwargs["min_child_weight"] <= 0:
+            raise ValueError("min_child_weight must be positive.")
         if kwargs["min_split_gain"] < 0:
             raise ValueError("min_split_gain must be non-negative.")
         if kwargs["threads_per_block"] <= 0 or kwargs["threads_per_block"] % 32 != 0:
@@ -143,16 +144,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
 
     def _compute_tree_predictions(self, tree, bin_indices):
-        """
-        Compute predictions from a single tree for all samples.
-        
-        Args:
-            tree: Tree dict with structure
-            bin_indices: Binned features for samples
-        
-        Returns:
-            torch.Tensor: Predictions for each sample
-        """
         num_samples = bin_indices.size(0)
         predictions = torch.zeros(num_samples, device=self.device, dtype=torch.float32)
         
@@ -184,31 +175,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return predictions
     
     def _compute_softmax_gradients_hessians(self, y_true_encoded):
-        """
-        Compute gradients and hessians for softmax multiclass classification.
-        
-        Args:
-            y_true_encoded: 1D tensor of encoded class labels [n_samples]
-        
-        Returns:
-            gradients: 2D tensor [n_samples, n_classes]
-            hessians: 2D tensor [n_samples, n_classes]
-        """
-        # Compute probabilities from current predictions using softmax
         probs = softmax(self.gradients, dim=1)  # [n_samples, n_classes]
         
-        # Create one-hot encoded labels
         n_samples = y_true_encoded.shape[0]
         y_onehot = torch.zeros(n_samples, self.num_classes, device=self.device)
         y_onehot[torch.arange(n_samples), y_true_encoded.long()] = 1.0
         
-        # Gradient: p_k - y_k
         gradients = probs - y_onehot
-        
-        # Hessian: p_k * (1 - p_k) (diagonal approximation)
-        # This treats each class independently which is computationally efficient
         hessians = probs * (1.0 - probs)
-        # Clamp hessians to avoid numerical issues
         hessians = torch.clamp(hessians, min=1e-6)
         
         return gradients, hessians
@@ -216,7 +190,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     def validate_fit_params(
         self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric
     ):
-        # ─── Required: X and y ───
         if not isinstance(X, np.ndarray) or not isinstance(y, np.ndarray):
             raise TypeError("X and y must be numpy arrays.")
         if X.ndim != 2:
@@ -228,7 +201,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"X and y must have the same number of rows. Got {X.shape[0]} and {y.shape[0]}."
             )
 
-        # ─── Optional: era_id ───
         if era_id is not None:
             if not isinstance(era_id, np.ndarray):
                 raise TypeError("era_id must be a numpy array.")
@@ -241,10 +213,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     f"era_id must have same length as y. Got {len(era_id)} and {len(y)}."
                 )
 
-        # ─── Optional: Eval Set ───
         eval_args = [X_eval, y_eval, eval_every_n_trees]
         if any(arg is not None for arg in eval_args):
-            # Require all of them
             if X_eval is None or y_eval is None or eval_every_n_trees is None:
                 raise ValueError(
                     "If using eval set, X_eval, y_eval, and eval_every_n_trees must all be defined."
@@ -279,7 +249,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                         f"early_stopping_rounds must be a positive integer, got {early_stopping_rounds}."
                     )
             else:
-                # No early stopping = set to "never trigger"
                 early_stopping_rounds = self.n_estimators + 1
 
             valid_metrics = ["mse", "corr", "rmsle", "logloss", "accuracy"]
@@ -288,7 +257,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     f"Invalid eval_metric: {eval_metric}. Choose from {valid_metrics}."
                 )
 
-        return early_stopping_rounds  # May have been defaulted here
+        return early_stopping_rounds
 
     def fit(
         self,
@@ -305,49 +274,38 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric
         )
 
-        # Set random seed for reproducibility
         if self.random_state is not None:
             torch.manual_seed(self.random_state)
             np.random.seed(self.random_state)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(self.random_state)
                 torch.cuda.manual_seed_all(self.random_state)
-                # Note: Some CUDA operations may still be non-deterministic
-                # For full determinism, set: torch.use_deterministic_algorithms(True)
-                # but this may impact performance
 
-        # ─── Warm Start Logic ───
         if not self.warm_start or not self._is_fitted:
-            # Fresh start: reset training state
             self._is_fitted = False
             self._trees_trained = 0
             self.forest = [{} for _ in range(self.n_estimators)] if self.objective == "regression" else []
             self.training_loss = []
             self.eval_loss = []
         else:
-            # Continuing training: validate that data is compatible
             if X.shape[1] != self.num_features:
                 raise ValueError(
                     f"X has {X.shape[1]} features, but model was trained with {self.num_features} features."
                 )
             if self._trees_trained >= self.n_estimators:
-                # Already have all requested trees
                 print(f"Model already has {self._trees_trained} trees (n_estimators={self.n_estimators}). No additional training needed.")
                 return self
 
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
 
-        # ─── Handle multiclass vs regression ───
         if self.objective == "multiclass" or self.objective == "binary":
-            # Encode labels
             if not self.warm_start or not self._is_fitted:
                 self.label_encoder = LabelEncoder()
                 y_encoded = self.label_encoder.fit_transform(y)
                 self.classes_ = self.label_encoder.classes_
                 self.num_classes = len(self.classes_)
             else:
-                # Warm start: use existing label encoder
                 y_encoded = self.label_encoder.transform(y)
             
             if self.objective == "binary" and self.num_classes != 2:
@@ -358,13 +316,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return self._fit_classification(X, y_encoded, era_id, X_eval, y_eval, 
                                            eval_every_n_trees, early_stopping_rounds, eval_metric)
         else:
-            # Regression path (unchanged)
             return self._fit_regression(X, y, era_id, X_eval, y_eval,
                                        eval_every_n_trees, early_stopping_rounds, eval_metric)
 
     def _fit_regression(self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric):
-        """Original regression fitting logic"""
-        # Train data preprocessing
         self.bin_indices, self.era_indices, self.bin_edges, self.unique_eras, self.Y_gpu = (
             self.preprocess_gpu_data(X, y, era_id)
         )
@@ -372,17 +327,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
         
-        # Initialize gradients (predictions)
         if self.warm_start and self._is_fitted and self._trees_trained > 0:
-            # Warm start: restore predictions from existing forest
             self.gradients = torch.zeros_like(self.Y_gpu) + self.base_prediction
-            # Add predictions from existing trees
             for tree in self.forest[:self._trees_trained]:
                 if tree:
                     leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
                     self.gradients += leaf_updates
         else:
-            # Fresh start
             self.gradients = torch.zeros_like(self.Y_gpu)
             self.base_prediction = self.Y_gpu.mean().item()
             self.gradients += self.base_prediction
@@ -390,7 +341,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
-        # ─── Optional Eval Set ───
         if X_eval is not None and y_eval is not None:
             self.bin_indices_eval = self.bin_inference_data(X_eval)
             self.Y_gpu_eval = torch.from_numpy(y_eval).to(torch.float32).to(self.device)
@@ -403,41 +353,45 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.eval_every_n_trees = None
             self.early_stopping_rounds = None
 
-        # ─── Grow the forest ───
         with torch.no_grad():
             self.grow_forest()
 
         del self.bin_indices
         del self.Y_gpu
-
         gc.collect()
 
         return self
     
-    def _fit_classification(self, X, y_encoded, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric):
-        """Multiclass classification fitting logic"""
-        # Train data preprocessing
+    def _fit_classification(self, X, y_encoded, era_id, X_eval, y_eval,
+                            eval_every_n_trees, early_stopping_rounds, eval_metric):
+        # ── Train data preprocessing ──
         self.bin_indices, self.era_indices, self.bin_edges, self.unique_eras, _ = (
             self.preprocess_gpu_data(X, y_encoded, era_id)
         )
         self.num_samples, self.num_features = X.shape
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
-        
-        # Store labels as integers
+
+        # Labels on device (int32)
         self.Y_gpu = torch.from_numpy(y_encoded).to(torch.int32).to(self.device)
-        
-        # Initialize scores F[i,k] - shape (N, K)
+
+        # Cache era_ends once (exclusive ends)
+        E = int(self.era_indices.max().item()) + 1
+        self._era_ends = torch.cumsum(
+            torch.bincount(self.era_indices, minlength=E).to(torch.int32),
+            dim=0
+        ).to(torch.int32)
+
+        # Class log-priors (for stable init + consistent predict init)
+        self.class_log_prior_ = torch.empty(self.num_classes, device=self.device, dtype=torch.float32)
+        for k in range(self.num_classes):
+            pk = (self.Y_gpu == k).float().mean()
+            self.class_log_prior_[k] = torch.log(pk + 1e-10)
+
+        # ── Initialize scores F[i,k] ──
         if self.warm_start and self._is_fitted and self._trees_trained > 0:
-            # Warm start: restore predictions from existing forest
-            self.gradients = torch.zeros((self.num_samples, self.num_classes), 
-                                         dtype=torch.float32, device=self.device)
-            # Initialize with class priors
-            for k in range(self.num_classes):
-                prior_k = (self.Y_gpu == k).float().mean()
-                if prior_k > 0:
-                    self.gradients[:, k] = torch.log(prior_k + 1e-10)
-            
+            # Start from priors
+            self.gradients = self.class_log_prior_.unsqueeze(0).expand(self.num_samples, -1).clone()
             # Add predictions from existing trees
             for round_trees in self.forest[:self._trees_trained]:
                 for class_k, tree in enumerate(round_trees):
@@ -445,23 +399,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                         leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
                         self.gradients[:, class_k] += leaf_updates
         else:
-            # Fresh start
-            self.gradients = torch.zeros((self.num_samples, self.num_classes), 
-                                         dtype=torch.float32, device=self.device)
-            
-            # Initialize with class priors (optional but helps convergence)
-            for k in range(self.num_classes):
-                prior_k = (self.Y_gpu == k).float().mean()
-                if prior_k > 0:
-                    self.gradients[:, k] = torch.log(prior_k + 1e-10)
-        
+            # Fresh start = just priors
+            self.gradients = self.class_log_prior_.unsqueeze(0).expand(self.num_samples, -1).clone()
+
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
-        # ─── Optional Eval Set ───
+        # ── Optional Eval Set ──
         if X_eval is not None and y_eval is not None:
             self.bin_indices_eval = self.bin_inference_data(X_eval)
-            # Encode eval labels
             y_eval_encoded = self.label_encoder.transform(y_eval)
             self.Y_gpu_eval = torch.from_numpy(y_eval_encoded).to(torch.int32).to(self.device)
             self.eval_every_n_trees = eval_every_n_trees
@@ -473,16 +419,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.eval_every_n_trees = None
             self.early_stopping_rounds = None
 
-        # ─── Grow the forest (K trees per iteration) ───
+        # ── Grow the forest (K trees per iteration) ──
         with torch.no_grad():
             self.grow_forest_multiclass()
 
         del self.bin_indices
         del self.Y_gpu
-
         gc.collect()
-
         return self
+
 
     def preprocess_gpu_data(self, X_np, Y_np, era_id_np):
         with torch.no_grad():
@@ -540,6 +485,94 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             unique_eras, era_indices = torch.unique(era_id_gpu, return_inverse=True)
             return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
 
+    # --- Helpers ---
+
+    def _era_ends_from_indices(self) -> torch.Tensor:
+        # Precomputed once in _fit_classification
+        return self._era_ends
+
+    def _pack_idx_mat(self, node_idx_by_class):
+        """
+        node_idx_by_class: list[Tensor[int32 or int64]] length K; each 1-D GPU tensor of row ids.
+        Returns:
+        idx_mat: [K, Mmax] int32 (CUDA)
+        idx_len: [K] int32 (CUDA)
+        Mmax:    int
+        """
+        K = len(node_idx_by_class)
+        if K == 0:
+            idx_mat = torch.empty((0, 1), device=self.device, dtype=torch.int32)
+            idx_len = torch.zeros(0, device=self.device, dtype=torch.int32)
+            return idx_mat, idx_len, 1
+
+        # Fast packing using pad_sequence (C++ impl)
+        idx_mat = pad_sequence(node_idx_by_class, batch_first=True, padding_value=-1).to(dtype=torch.int32)
+        idx_len = torch.tensor([len(t) for t in node_idx_by_class], device=self.device, dtype=torch.int32)
+        Mmax = idx_mat.size(1)
+        
+        return idx_mat, idx_len, Mmax
+
+    def _mc_hist_batched_for_node(
+        self,
+        *,
+        feat_idx: torch.Tensor,           # [k] int32
+        grads: torch.Tensor,              # [N, K_total] float32 (full tensor, avoid copy)
+        hess: torch.Tensor,               # [N, K_total] float32 (full tensor, avoid copy)
+        idx_mat: torch.Tensor,            # [G, Mmax] int32
+        idx_len: torch.Tensor,            # [G] int32
+        active_classes: torch.Tensor,     # [G] int32 (global class indices for G/H access)
+        k_tile_hint: int = 0,
+        threads_per_block_hint: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Batched per-era histograms for G groups (classes or child subsets).
+        Optimized to use indirect class access in kernel.
+        Returns:
+            GH, HH with shape [E, k, G, B] (float32, contiguous)
+        """
+        GH, HH = node_kernel.h_des_mc(
+            self.bin_indices,                              # [N,F] int8
+            grads.contiguous(),                            # [N,K_total] f32
+            hess.contiguous(),                             # [N,K_total] f32
+            idx_mat.contiguous(),                          # [G,Mmax] i32
+            idx_len.contiguous(),                          # [G] i32
+            feat_idx.contiguous(),                         # [k] i32
+            self.era_indices.contiguous(),                 # [N] i32
+            active_classes.contiguous().to(torch.int32),   # [G] i32 (active class list)
+            int(self.num_bins),
+            int(k_tile_hint),
+            int(threads_per_block_hint),
+        )
+        # Expect [E, k, G, B]
+        return GH, HH
+
+    def _get_split_scratch(self, k_cur: int):
+        need_new = (
+            not hasattr(self, "_scratch_gain") or
+            self._scratch_gain is None or
+            self._scratch_gain.shape[1] != k_cur
+        )
+        if need_new:
+            self._scratch_gain = torch.zeros(
+                self.num_eras, k_cur, self.num_bins - 1,
+                device=self.device, dtype=torch.float32
+            )
+            self._scratch_dir = torch.zeros_like(self._scratch_gain)
+        else:
+            self._scratch_gain.zero_()
+            self._scratch_dir.zero_()
+        return self._scratch_gain, self._scratch_dir
+
+    def _partition_one_class(self, idx: torch.Tensor, global_feat: int, split_bin: int):
+        """Split indices for a single class/node by feature<=bin (all on GPU)."""
+        if idx.numel() == 0:
+            return idx, idx
+        fcol = self.bin_indices[idx, global_feat]  # int8
+        mask_left = (fcol <= split_bin)
+        left = idx[mask_left]
+        right = idx[~mask_left]
+        return left, right
+
     def compute_histograms(self, sample_indices, feature_indices):
         grad_hist = torch.zeros(
             ( self.num_eras, len(feature_indices), self.num_bins), device=self.device, dtype=torch.float32
@@ -560,6 +593,47 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.threads_per_block,
             self.rows_per_thread,
         )
+        return grad_hist, hess_hist
+    
+    def compute_histograms_multiclass(self, sample_indices, feature_indices, grad, hess):
+        """
+        Compute histograms for multiclass - similar to regression but with explicit grad/hess
+        """
+        grad_hist = torch.zeros(
+            (self.num_eras, len(feature_indices), self.num_bins), 
+            device=self.device, dtype=torch.float32
+        )
+        hess_hist = torch.zeros(
+            (self.num_eras, len(feature_indices), self.num_bins), 
+            device=self.device, dtype=torch.float32
+        )
+
+        # We need to create temporary tensors that match what compute_histogram3 expects
+        # It expects self.residual, but we have grad/hess per class
+        # Save the original residual
+        saved_residual = self.residual if hasattr(self, 'residual') else None
+        
+        # Create a dummy dataset structure for histogram computation
+        # The histogram kernel accumulates residuals, so we pass grad directly as residual
+        self.residual = grad
+        
+        node_kernel.compute_histogram3(
+            self.bin_indices,
+            self.residual,
+            sample_indices,
+            feature_indices,
+            self.era_indices,
+            grad_hist,
+            hess_hist,
+            self.num_bins,
+            self.threads_per_block,
+            self.rows_per_thread,
+        )
+        
+        # Restore
+        if saved_residual is not None:
+            self.residual = saved_residual
+            
         return grad_hist, hess_hist
 
     def find_best_split(self, gradient_histogram, hessian_histogram):
@@ -593,6 +667,124 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         return best_feature.item(), best_bin.item()
 
+    def find_best_split_classification(
+            self,
+            GH_parent: torch.Tensor,          # [E, k, K, B]
+            HH_parent: torch.Tensor,          # [E, k, K, B]
+            feat_idx: torch.Tensor,           # [k] int32 (local -> global feature ids)
+            node_idx_by_class: list[torch.Tensor],
+        ):
+            """
+            Vectorized 'find_best_split' for multiclass.
+
+            GH_parent / HH_parent : [E, k, K, B]
+            feat_idx              : [k] int32
+            node_idx_by_class     : list of length K, each a 1D CUDA int32 index tensor
+            
+            Returns:
+                best_local_feat : list[int] length K (0..k-1 or -1)
+                best_bin        : list[int] length K (0..B-2 or -1)
+                can_split       : list[bool] length K
+            """
+            device = GH_parent.device
+            E, k, K, B = GH_parent.shape
+            F = k  # local feature count
+            assert E == self.num_eras
+
+            # --- 1) Very cheap sample-count gating per class ---
+            class_sizes = torch.tensor(
+                [int(idx.numel()) for idx in node_idx_by_class],
+                device=device,
+                dtype=torch.float32,
+            )
+            # Require at least 2 samples in the node to even consider splitting
+            enough_samples = class_sizes >= 2.0   # [K]
+
+            # --- 2) Flatten (class, feature) into one feature axis for compute_split ---
+            # GH_parent: [E, F, K, B] -> [E, K*F, B]
+            GH_flat = GH_parent.permute(0, 2, 1, 3).reshape(E, K * F, B).contiguous()
+            HH_flat = HH_parent.permute(0, 2, 1, 3).reshape(E, K * F, B).contiguous()
+
+            per_era_gain_flat = torch.zeros(
+                E, K * F, B - 1, device=device, dtype=torch.float32
+            )
+            per_era_dir_flat = torch.zeros_like(per_era_gain_flat)
+
+            node_kernel.compute_split(
+                GH_flat,
+                HH_flat,
+                self.min_split_gain,
+                self.min_child_weight,
+                self.L2_reg,
+                per_era_gain_flat,
+                per_era_dir_flat,
+                self.threads_per_block,
+            )
+
+            # Reshape back to [E, K, F, B-1]
+            per_era_gain_cf = per_era_gain_flat.view(E, K, F, B - 1)
+            per_era_dir_cf  = per_era_dir_flat.view(E, K, F, B - 1)
+
+            # --- 3) Collapse eras, reproduce regression-era logic per class ---
+            if E == 1:
+                # era_splitting_criterion = per_era_gain[0, :, :]
+                crit = per_era_gain_cf[0]        # [K, F, B-1]
+                crit_2d = crit.view(K, -1)       # [K, F*(B-1)]
+                mask_2d = crit_2d > self.min_split_gain
+            else:
+                # directional_agreement = per_era_direction.mean(dim=0).abs()
+                dir_agree = per_era_dir_cf.mean(dim=0).abs()   # [K, F, B-1]
+                crit      = per_era_gain_cf.mean(dim=0)        # [K, F, B-1]
+
+                dir_2d  = dir_agree.view(K, -1)                # [K, F*(B-1)]
+                crit_2d = crit.view(K, -1)                     # [K, F*(B-1)]
+
+                max_dir, _ = dir_2d.max(dim=1, keepdim=True)   # [K, 1]
+                mask_2d = (dir_2d == max_dir) & (crit_2d > self.min_split_gain)
+
+            # Apply sample-count gating
+            mask_2d = mask_2d & enough_samples.view(K, 1)
+
+            # --- 4) Argmax per class under the mask ---
+            best_local_feat = [-1] * K
+            best_bin = [-1] * K
+            can_split = [False] * K
+
+            if mask_2d.numel() == 0:
+                return best_local_feat, best_bin, can_split
+
+            neg_inf = torch.finfo(crit_2d.dtype).min
+            crit_masked = torch.where(mask_2d, crit_2d, neg_inf)
+
+            has_candidate = mask_2d.any(dim=1)       # [K]
+            best_flat_idx = crit_masked.argmax(dim=1)  # [K]
+
+            # --- 5) Decode (feature, bin) and update feature importance ---
+            for c in range(K):
+                if not bool(has_candidate[c].item()):
+                    continue
+
+                flat = int(best_flat_idx[c].item())
+                lf = flat // (B - 1)   # local feature index
+                lb = flat % (B - 1)    # bin index
+
+                best_local_feat[c] = lf
+                best_bin[c] = lb
+                can_split[c] = True
+
+                # Map to global feature id
+                global_f = int(feat_idx[lf].item())
+
+                # per-era gains for this (class, feature, bin)
+                per_era_gains = per_era_gain_cf[:, c, lf, lb]  # [E]
+                for e_idx in range(self.num_eras):
+                    self.per_era_feature_importance_[e_idx, global_f] += float(
+                        per_era_gains[e_idx].item()
+                    )
+
+            return best_local_feat, best_bin, can_split
+
+
 
     def grow_tree(self, gradient_histogram, hessian_histogram, node_indices, depth, class_k=None):
         if depth == self.max_depth:
@@ -623,8 +815,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Track feature importance: accumulate per-era gains for the chosen feature
         global_feature_idx = self.feat_indices_tree[local_feature].item()
         per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [num_eras]
-        for era_idx in range(self.num_eras):
-            self.per_era_feature_importance_[era_idx, global_feature_idx] += per_era_gains[era_idx].item()
+        
+        # OPTIMIZATION: Vectorized GPU accumulation
+        self.per_era_feature_importance_[:, global_feature_idx] += per_era_gains
         
         split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
         left_indices = node_indices[split_mask]
@@ -656,46 +849,224 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "left": left_child,
             "right": right_child,
         }
-    
-    def get_eval_metric(self, y_true, y_pred):
-        if self.eval_metric == "mse":
-            return ((y_true - y_pred) ** 2).mean().item()
-        elif self.eval_metric == "corr":
-            return 1 - torch.corrcoef(torch.vstack([y_true, y_pred]))[0, 1].item()
-        elif self.eval_metric == "rmsle":
-            return rmsle_torch(y_true, y_pred).item()
+
+    # --- Multiclass Recursive Grow with Newton Logic ---
+
+    def _grow_tree_multiclass_round(
+        self,
+        grads: torch.Tensor,        # [N, K]
+        hess: torch.Tensor,         # [N, K]
+        feat_idx: torch.Tensor,     # [k]
+        node_idx_by_class,          # list[Tensor[int32]] length K
+        depth: int,
+        seed_hist_by_class: dict | None = None,
+    ):
+        device = self.device
+        K = len(node_idx_by_class)
+        k = int(feat_idx.numel())
+        empty_idx = torch.empty(0, dtype=torch.int32, device=device)
+
+        # ── Base case: make leaves ──
+        if depth == self.max_depth or k == 0:
+            trees = []
+            for c in range(K):
+                idx = node_idx_by_class[c]
+                if idx.numel() == 0:
+                    trees.append({"leaf_value": 0.0, "samples": 0})
+                else:
+                    # NEWTON STEP: Leaf = - Sum(G) / (Sum(H) + L2)
+                    # NOTE: We expect 'grads' passed in to be Gradients (p-y).
+                    # So we take -sum(grads).
+                    # If 'grads' passed in were negative gradients, we would take sum(grads).
+                    # Let's assume 'grads' here are Gradients (p-y).
+                    g_sum = grads[idx, c].sum()
+                    h_sum = hess[idx, c].sum()
+                    
+                    leaf_val = -g_sum / (h_sum + self.L2_reg)
+                    
+                    self.gradients[idx, c] += self.learning_rate * leaf_val
+                    trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
+            return trees
+
+        # ── Build/collect parent histograms ──
+        if seed_hist_by_class:
+            need_build = []
+            GH_parent = torch.zeros((self.num_eras, k, K, self.num_bins),
+                                    device=device, dtype=torch.float32)
+            HH_parent = torch.zeros_like(GH_parent)
+            for c in range(K):
+                if node_idx_by_class[c].numel() == 0:
+                    continue
+                seed = seed_hist_by_class.get(c, None)
+                if seed is None:
+                    need_build.append(c)
+                else:
+                    GH_parent[:, :, c, :] = seed[0]
+                    HH_parent[:, :, c, :] = seed[1]
+
+            if need_build:
+                idx_list = [node_idx_by_class[c] for c in need_build]
+                idx_mat, idx_len, _ = self._pack_idx_mat(idx_list)
+                
+                # Indirect access list
+                sel_c = torch.tensor(need_build, device=device, dtype=torch.int32)
+                
+                # Optimized call: Pass full grads/hess + indices
+                GH_miss, HH_miss = self._mc_hist_batched_for_node(
+                    feat_idx=feat_idx,
+                    grads=grads,
+                    hess=hess,
+                    idx_mat=idx_mat,
+                    idx_len=idx_len,
+                    active_classes=sel_c
+                )
+                
+                sel_c_long = sel_c.to(torch.long)
+                GH_parent.index_copy_(2, sel_c_long, GH_miss)
+                HH_parent.index_copy_(2, sel_c_long, HH_miss)
         else:
-            raise ValueError(f"Invalid eval_metric: {self.eval_metric}.")
-
-    def compute_eval(self, i):
-        if self.eval_every_n_trees == None:
-            return
-        
-        train_loss = ((self.Y_gpu - self.gradients) ** 2).mean().item()
-        self.training_loss.append(train_loss)
-
-        if i % self.eval_every_n_trees == 0:
-            eval_preds = self.predict_binned(self.bin_indices_eval)
-            eval_loss = self.get_eval_metric( self.Y_gpu_eval, eval_preds )
-            self.eval_loss.append(eval_loss)
-
-            if len(self.eval_loss) > self.early_stopping_rounds:
-                if self.eval_loss[-(self.early_stopping_rounds+1)] < self.eval_loss[-1]:
-                    self.stop = True
-
-            print(
-                f"🌲 Tree {i+1}/{self.n_estimators} | Train MSE: {train_loss:.6f} | Eval {self.eval_metric}: {eval_loss:.6f}"
+            idx_mat, idx_len, _ = self._pack_idx_mat(node_idx_by_class)
+            all_classes = torch.arange(K, device=device, dtype=torch.int32)
+            
+            GH_parent, HH_parent = self._mc_hist_batched_for_node(
+                feat_idx=feat_idx,
+                grads=grads,
+                hess=hess,
+                idx_mat=idx_mat,
+                idx_len=idx_len,
+                active_classes=all_classes
             )
 
-            del eval_preds, eval_loss, train_loss
+        # ── Pick best split per class ──
+        
+
+        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins - 1,
+                                        device=device, dtype=torch.float32)
+        self.per_era_direction = torch.zeros_like(self.per_era_gain)
+
+        best_local_feat, best_bin, can_split = self.find_best_split_classification(
+            GH_parent, HH_parent, feat_idx, node_idx_by_class
+        )
+
+        if not any(can_split):
+            # Fallback to leaves
+            return self._grow_tree_multiclass_round(grads, hess, feat_idx, node_idx_by_class, self.max_depth)
+
+        # ── Partition per class ──
+        active_classes = [c for c in range(K) if can_split[c]]
+        small_is_left = {}
+        left_idx_by_c, right_idx_by_c = {}, {}
+        
+        for c in active_classes:
+            lf, lb = best_local_feat[c], best_bin[c]
+            
+            # Check children weights
+            HHc_feat = HH_parent[:, lf, c, :]
+            total = HHc_feat.sum()
+            left_H = HHc_feat[:, : (lb + 1)].sum()
+            right_H = total - left_H
+            
+            if left_H < self.min_child_weight or right_H < self.min_child_weight:
+                can_split[c] = False
+                continue
+
+            small_is_left[c] = (left_H <= right_H)
+            
+            idx = node_idx_by_class[c]
+            gl_f = int(feat_idx[lf].item())
+            L, R = self._partition_one_class(idx, gl_f, lb)
+            left_idx_by_c[c] = L
+            right_idx_by_c[c] = R
+
+        # Re-filter
+        active_classes = [c for c in active_classes if can_split[c]]
+
+        # ── Build small-child histograms ──
+        small_lists = [
+            (left_idx_by_c[c] if small_is_left[c] else right_idx_by_c[c])
+            for c in active_classes
+        ]
+        
+        if small_lists:
+            idx_mat_small, idx_len_small, _ = self._pack_idx_mat(small_lists)
+            sel_c_small = torch.tensor(active_classes, device=device, dtype=torch.int32)
+            
+            GH_small, HH_small = self._mc_hist_batched_for_node(
+                feat_idx=feat_idx,
+                grads=grads,
+                hess=hess,
+                idx_mat=idx_mat_small,
+                idx_len=idx_len_small,
+                active_classes=sel_c_small
+            )
+            
+            sel = sel_c_small.to(torch.long)
+            GH_parent_sel = GH_parent.index_select(2, sel)
+            HH_parent_sel = HH_parent.index_select(2, sel)
+            GH_big = GH_parent_sel.sub_(GH_small)
+            HH_big = HH_parent_sel.sub_(HH_small)
+        else:
+            GH_small, HH_small, GH_big, HH_big = None, None, None, None
+
+        # ── Recurse ──
+        seed_left_ALL = {}
+        seed_right_ALL = {}
+
+        if GH_small is not None:
+            for j, c in enumerate(active_classes):
+                GH_s = GH_small[:, :, j, :].contiguous()
+                HH_s = HH_small[:, :, j, :].contiguous()
+                GH_b = GH_big[:, :, j, :].contiguous()
+                HH_b = HH_big[:, :, j, :].contiguous()
+
+                if small_is_left[c]:
+                    seed_left_ALL[c] = (GH_s, HH_s)
+                    seed_right_ALL[c] = (GH_b, HH_b)
+                else:
+                    seed_left_ALL[c] = (GH_b, HH_b)
+                    seed_right_ALL[c] = (GH_s, HH_s)
+        
+        # Prepare lists for next level (non-split classes carry empty indices -> become leaves)
+        left_nodes_next = [left_idx_by_c.get(c, empty_idx) if can_split[c] else empty_idx for c in range(K)]
+        right_nodes_next = [right_idx_by_c.get(c, empty_idx) if can_split[c] else empty_idx for c in range(K)]
+        
+        all_left = self._grow_tree_multiclass_round(
+            grads, hess, feat_idx, left_nodes_next, depth + 1, seed_hist_by_class=seed_left_ALL
+        )
+        all_right = self._grow_tree_multiclass_round(
+            grads, hess, feat_idx, right_nodes_next, depth + 1, seed_hist_by_class=seed_right_ALL
+        )
+        
+        trees = []
+        for c in range(K):
+            if can_split[c]:
+                trees.append({
+                    "feature": torch.tensor(int(feat_idx[best_local_feat[c]].item()), dtype=torch.float32),
+                    "bin": int(best_bin[c]),
+                    "left": all_left[c],
+                    "right": all_right[c],
+                })
+            else:
+                # Create leaf for classes that didn't split
+                idx = node_idx_by_class[c]
+                if idx.numel() == 0:
+                    trees.append({"leaf_value": 0.0, "samples": 0})
+                else:
+                    # Newton leaf
+                    g_sum = grads[idx, c].sum()
+                    h_sum = hess[idx, c].sum()
+                    leaf_val = -g_sum / (h_sum + self.L2_reg)
+                    self.gradients[idx, c] += self.learning_rate * leaf_val
+                    trees.append({"leaf_value": float(leaf_val.item()), "samples": int(idx.numel())})
+
+        return trees
 
     def grow_forest(self):
-        """Regression forest growing (original logic)"""
-        # Warm start: preserve existing training state
+        """Regression forest growing (unchanged)"""
         if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
             self.training_loss = []
-            self.eval_loss = []  # if eval set is given
-            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+            self.eval_loss = []
+            self.per_era_feature_importance_ = torch.zeros((self.num_eras, self.num_features), device=self.device, dtype=torch.float32)
         
         self.stop = False
 
@@ -708,10 +1079,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
-        # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
         
-        # Ensure forest has enough slots
         if len(self.forest) < self.n_estimators:
             self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
 
@@ -737,22 +1106,22 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if self.stop:
                 break
 
-        # Aggregate feature importance across eras
-        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0).cpu().numpy()
+        self.per_era_feature_importance_ = self.per_era_feature_importance_.cpu().numpy()
         self._is_fitted = True
         
         print(f"Finished training forest. Total trees: {self._trees_trained}")
 
     def grow_forest_multiclass(self):
-        """Multiclass forest growing - K trees per iteration"""
-        # Warm start: preserve existing training state
+        """
+        Optimized Multiclass (Newton)
+        """
         if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
             self.training_loss = []
             self.eval_loss = []
-            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
-            # Store K trees per iteration
+            self.per_era_feature_importance_ = torch.zeros((self.num_eras, self.num_features), device=self.device, dtype=torch.float32)
             self.forest = []
-        
+
         self.stop = False
 
         if self.colsample_bytree < 1.0:
@@ -760,65 +1129,79 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         else:
             self.feat_indices_tree = self.feature_indices
             k = self.num_features
-            
-        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
-        # Warm start: start from where we left off
+        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins - 1, device=self.device, dtype=torch.float32)
+        self.per_era_direction = torch.zeros_like(self.per_era_gain)
+
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
 
         for i in range(start_iter, self.n_estimators):
-            # Compute softmax probabilities and gradients/hessians for all classes
+            # Newton Boosting: Get Gradients (p-y) and Hessians (p(1-p))
             grads, hess = self._compute_softmax_gradients_hessians(self.Y_gpu)
             
-            # Train K trees (one per class)
-            trees_k = []
+            # Note: We pass 'grads' (p-y) and 'hess' (p(1-p))
+            # The histogram will sum them.
+            # The gain formula in kernel expects (SumG)^2 / SumH.
+            # Since we want to MINIMIZE loss, and gain is Reduction in Loss,
+            # G^2/H works for Newton direction regardless of sign.
+            # But for LEAF value: -Sum(p-y) / Sum(p(1-p)).
+            # To use the same G for histogram and leaf, we use 'grads' directly.
+            # BUT wait: Gain calculation uses (G_L^2/H_L + ...).
+            # If G is (p-y), then -G is (y-p). Squared it is the same.
+            # BUT we must use -G for leaf value if we sum G.
+            
+            # Optimization: We pass a negative gradient if we want the kernel to calculate Gain correctly?
+            # Actually, Gain depends on G^2, so sign doesn't matter for splits.
+            # The only place sign matters is leaf value.
+            # Leaf value = -Sum(G) / Sum(H).
+            # So we can pass G, sum it to S, then Leaf = -S/H.
+            
+            # NOTE: We pass -grads to the histogram builder in previous versions.
+            # Why? Because usually G = dL/dF. For regression (MSE), L = 1/2(y-p)^2 -> dL/dp = -(y-p) = p-y.
+            # Negative gradient is (y-p).
+            # XGBoost uses g = dL/dpred.
+            # Obj approx: g*ft + 1/2*h*ft^2.
+            # Opt ft = -g/h.
+            # Gain = 1/2 * g^2/h.
+            # So yes, using 'grads' (p-y) is correct for XGBoost style.
+            # And Leaf = -sum(grads)/sum(hess).
             
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+            else:
+                self.feat_indices_tree = self.feature_indices
+
+            root_idx = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
+            node_idx_by_class = [root_idx for _ in range(self.num_classes)]
+
+            # IMPORTANT: Pass 'grads' (p-y) and 'hess' (p(1-p))
+            # We previously passed -grads. Let's stick to passing 'grads' and negating at leaf calc.
+            # Actually, looking at my `_grow_tree_multiclass_round` above:
+            # leaf_val = -g_sum / (h_sum + L2).
+            # So passing `grads` is consistent with this formula.
             
-            for class_k in range(self.num_classes):
-                # Set residual for this class (negative gradient)
-                self.residual = -grads[:, class_k]
-                
-                # Compute histograms for this class
-                # For multiclass, we treat hessian as "weights" - use them directly
-                # We'll compute histograms by accumulating grad and hess
-                self.root_gradient_histogram, self.root_hessian_histogram = (
-                    self.compute_histograms_multiclass(
-                        self.root_node_indices, 
-                        self.feat_indices_tree, 
-                        self.residual,
-                        hess[:, class_k]
-                    )
-                )
-                
-                # Grow tree for this class (pass class_k to update correct column)
-                tree_k = self.grow_tree(
-                    self.root_gradient_histogram,
-                    self.root_hessian_histogram,
-                    self.root_node_indices,
-                    0,
-                    class_k=class_k,
-                )
-                trees_k.append(tree_k)
-            
+            trees_k = self._grow_tree_multiclass_round(
+                grads, hess,
+                self.feat_indices_tree.to(torch.int32),
+                node_idx_by_class, 
+                depth=0
+            )
+
             self.forest.append(trees_k)
             self._trees_trained = i + 1
-            
-            self.compute_eval_multiclass(i)
 
+            self.compute_eval_multiclass(i)
             if self.stop:
                 break
 
-        # Aggregate feature importance across eras
-        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0).cpu().numpy()
+        self.per_era_feature_importance_ = self.per_era_feature_importance_.cpu().numpy()
         self._is_fitted = True
-        
-        print(f"Finished training multiclass forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_classes} trees)")
+        print(f"Finished training multiclass forest. Total rounds: {self._trees_trained} "
+            f"({self._trees_trained * self.num_classes} trees)")
+
     
     def compute_eval_multiclass(self, i):
-        """Evaluation for multiclass"""
         if self.eval_every_n_trees is None:
             return
         
@@ -853,15 +1236,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             del eval_probs, eval_loss, train_loss
     
     def compute_histograms_multiclass(self, sample_indices, feature_indices, grad, hess):
-        """
-        Compute histograms for multiclass - similar to regression but with explicit grad/hess
-        
-        Args:
-            sample_indices: which samples to include
-            feature_indices: which features to use  
-            grad: gradient for this class [n_samples]
-            hess: hessian for this class [n_samples]
-        """
         grad_hist = torch.zeros(
             (self.num_eras, len(feature_indices), self.num_bins), 
             device=self.device, dtype=torch.float32
@@ -871,13 +1245,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             device=self.device, dtype=torch.float32
         )
 
-        # We need to create temporary tensors that match what compute_histogram3 expects
-        # It expects self.residual, but we have grad/hess per class
-        # Save the original residual
         saved_residual = self.residual if hasattr(self, 'residual') else None
-        
-        # Create a dummy dataset structure for histogram computation
-        # The histogram kernel accumulates residuals, so we pass grad directly as residual
         self.residual = grad
         
         node_kernel.compute_histogram3(
@@ -893,7 +1261,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.rows_per_thread,
         )
         
-        # Restore
         if saved_residual is not None:
             self.residual = saved_residual
             
@@ -937,7 +1304,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if is_integer_type and X_np.shape[1] == self.num_features:
             max_vals = X_np.max(axis=0)
             if np.all(max_vals < self.num_bins):
-                print("Detected pre-binned input at predict-time — skipping binning.")
+                # print("Detected pre-binned input at predict-time — skipping binning.")
                 is_prebinned = True
             else:
                 is_prebinned = False
@@ -955,31 +1322,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return bin_indices
 
     def predict(self, X_np):
-        """
-        Predict on new data.
-        
-        For regression: returns predicted values
-        For classification: returns predicted class labels
-        """
         if self.objective == "multiclass" or self.objective == "binary":
-            # Classification: return class labels
             probs = self.predict_proba(X_np)
             class_indices = np.argmax(probs, axis=1)
             return self.label_encoder.inverse_transform(class_indices)
         else:
-            # Regression: return values
             bin_indices = self.bin_inference_data(X_np)
             preds = self.predict_binned(bin_indices).cpu().numpy()
             del bin_indices
             return preds
     
     def predict_proba(self, X_np):
-        """
-        Predict class probabilities (classification only).
-        
-        Returns:
-            np.array of shape (n_samples, n_classes) with probabilities
-        """
         if self.objective not in ["multiclass", "binary"]:
             raise ValueError("predict_proba only available for classification objectives")
         
@@ -989,68 +1342,37 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return probs
     
     def predict_proba_binned(self, bin_indices):
-        """
-        Predict probabilities from pre-binned data (multiclass).
-        
-        Returns:
-            torch.Tensor of shape (n_samples, n_classes) with probabilities
-        """
         num_samples = bin_indices.size(0)
-        
-        # Initialize raw scores (logits) for all classes
-        F = torch.zeros((num_samples, self.num_classes), device=self.device, dtype=torch.float32)
-        
-        # Initialize with class priors if they were used during training
+        F = self.class_log_prior_.unsqueeze(0).expand(num_samples, -1).clone()
+
         for k in range(self.num_classes):
-            prior_k = (self.classes_ == self.classes_[k]).sum() / len(self.classes_)
-            if prior_k > 0:
-                F[:, k] = torch.log(torch.tensor(prior_k + 1e-10))
-        
-        # Accumulate predictions from all trees
-        for round_trees in self.forest:
-            if not round_trees:  # Skip if empty
+            trees_k = []
+            for round_trees in self.forest:
+                if round_trees and len(round_trees) > k:
+                    trees_k.append(round_trees[k])
+            
+            if not trees_k:
                 continue
-            for k, tree in enumerate(round_trees):
-                # Get predictions for class k
-                tree_tensor = self.flatten_tree(tree, max_nodes=2 ** (self.max_depth + 1)).to(self.device)
-                tree_preds = torch.zeros(num_samples, device=self.device)
                 
-                # Call predict kernel for this single tree
-                node_kernel.predict_forest(
-                    bin_indices.contiguous(),
-                    tree_tensor.unsqueeze(0).contiguous(),  # Add batch dimension
-                    self.learning_rate,
-                    tree_preds
-                )
-                
-                F[:, k] += tree_preds
-        
-        # Convert logits to probabilities via softmax
+            tree_tensor = torch.stack([
+                self.flatten_tree(t, max_nodes=2 ** (self.max_depth + 1)) 
+                for t in trees_k
+            ]).to(self.device)
+
+            tree_preds = torch.zeros(num_samples, device=self.device)
+            node_kernel.predict_forest(
+                bin_indices.contiguous(),
+                tree_tensor.contiguous(),
+                self.learning_rate,
+                tree_preds
+            )
+            F[:, k] += tree_preds
+
         probs = softmax(F, dim=1)
         return probs
 
+
     def get_feature_importance(self, importance_type='gain', normalize=True):
-        """
-        Get feature importance scores.
-        
-        Parameters:
-        -----------
-        importance_type : str, default='gain'
-            Type of importance. Currently only 'gain' is supported.
-        normalize : bool, default=True
-            If True, normalize importances to sum to 1.0
-        
-        Returns:
-        --------
-        np.ndarray
-            Array of shape (n_features,) with importance scores.
-            
-        Note:
-        -----
-        When era_id is used during training, this returns the sum of 
-        per-era importances. Use get_per_era_feature_importance() to 
-        see era-specific importances.
-        """
         if self.feature_importance_ is None:
             raise ValueError("Model has not been fitted yet.")
         
@@ -1065,28 +1387,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return importance
     
     def get_per_era_feature_importance(self, normalize=True):
-        """
-        Get per-era feature importance scores.
-        
-        Parameters:
-        -----------
-        normalize : bool, default=True
-            If True, normalize importances within each era to sum to 1.0
-        
-        Returns:
-        --------
-        np.ndarray
-            Array of shape (n_eras, n_features) with importance scores per era.
-            
-        Note:
-        -----
-        This is unique to WarpGBM's era-splitting capability. When no era_id
-        is provided during training (standard ERM setting), n_eras=1 and this
-        returns the same as get_feature_importance() but with shape (1, n_features).
-        
-        This allows you to see which features are invariant across eras vs
-        which features are only important in specific eras.
-        """
         if self.per_era_feature_importance_ is None:
             raise ValueError("Model has not been fitted yet.")
         
@@ -1101,26 +1401,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return importance
 
     def save_model(self, path):
-        """
-        Save the trained model to disk for later use.
-        
-        Parameters:
-        -----------
-        path : str
-            File path where the model will be saved (e.g., 'model.pkl')
-        
-        Example:
-        --------
-        >>> model = WarpGBM(n_estimators=100)
-        >>> model.fit(X_train, y_train)
-        >>> model.save_model('checkpoint_100.pkl')
-        """
         if not self._is_fitted:
             raise ValueError("Cannot save unfitted model. Call fit() first.")
         
-        # Collect all the necessary state to save
         state = {
-            # Hyperparameters
             'objective': self.objective,
             'num_bins': self.num_bins,
             'max_depth': self.max_depth,
@@ -1132,8 +1416,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             'colsample_bytree': self.colsample_bytree,
             'random_state': self.random_state,
             'warm_start': self.warm_start,
-            
-            # Trained state
             'forest': self.forest,
             'bin_edges': self.bin_edges,
             'base_prediction': self.base_prediction,
@@ -1155,32 +1437,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         print(f"Model saved to {path}")
     
     def load_model(self, path):
-        """
-        Load a previously saved model from disk.
-        
-        Parameters:
-        -----------
-        path : str
-            File path to the saved model (e.g., 'model.pkl')
-        
-        Returns:
-        --------
-        self : WarpGBM
-            The model instance with loaded state
-        
-        Example:
-        --------
-        >>> model = WarpGBM()
-        >>> model.load_model('checkpoint_100.pkl')
-        >>> # Continue training with warm_start
-        >>> model.warm_start = True
-        >>> model.n_estimators = 200  # Train 100 more trees
-        >>> model.fit(X_train, y_train)
-        """
         with open(path, 'rb') as f:
             state = pickle.load(f)
         
-        # Restore hyperparameters
         self.objective = state['objective']
         self.num_bins = state['num_bins']
         self.max_depth = state['max_depth']
@@ -1192,8 +1451,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.colsample_bytree = state['colsample_bytree']
         self.random_state = state['random_state']
         self.warm_start = state['warm_start']
-        
-        # Restore trained state
         self.forest = state['forest']
         self.bin_edges = state['bin_edges']
         self.base_prediction = state['base_prediction']

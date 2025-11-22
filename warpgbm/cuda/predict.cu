@@ -10,38 +10,46 @@ __global__ void predict_forest_kernel(
     float *__restrict__ out // [N]
 )
 {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t total_jobs = N * T;
-    if (idx >= total_jobs)
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= N)
         return;
 
-    int64_t i = idx % N; // sample index
-    int64_t t = idx / N; // tree index
+    float sum = 0.0f;
 
-    const float *tree = tree_tensor + t * max_nodes * 6;
-
-    int node_id = 0;
-    while (true)
+    // Each thread handles one sample and iterates over ALL trees
+    // This removes the need for atomicAdd to global memory
+    for (int64_t t = 0; t < T; ++t)
     {
-        float is_leaf = tree[node_id * 6 + 4];
-        if (is_leaf > 0.5f)
+        const float *tree = tree_tensor + t * max_nodes * 6;
+
+        int node_id = 0;
+        while (true)
         {
-            float val = tree[node_id * 6 + 5];
-            atomicAdd(&out[i], learning_rate * val);
-            return;
+            float is_leaf = tree[node_id * 6 + 4];
+            if (is_leaf > 0.5f)
+            {
+                sum += tree[node_id * 6 + 5];
+                break;
+            }
+
+            int feat = static_cast<int>(tree[node_id * 6 + 0]);
+            int split_bin = static_cast<int>(tree[node_id * 6 + 1]);
+            int left_id = static_cast<int>(tree[node_id * 6 + 2]);
+            int right_id = static_cast<int>(tree[node_id * 6 + 3]);
+
+            // Access bin index for this sample and feature
+            // Since 'i' is constant for this thread, this is reasonably efficient
+            int64_t bin_idx = i * F + feat;
+            int8_t bin = bin_indices[bin_idx];
+
+            node_id = (bin <= split_bin) ? left_id : right_id;
         }
-
-        int feat = static_cast<int>(tree[node_id * 6 + 0]);
-        int split_bin = static_cast<int>(tree[node_id * 6 + 1]);
-        int left_id = static_cast<int>(tree[node_id * 6 + 2]);
-        int right_id = static_cast<int>(tree[node_id * 6 + 3]);
-
-        // prevent overflow
-        int64_t bin_idx = i * F + feat;
-        int8_t bin = bin_indices[bin_idx];
-
-        node_id = (bin <= split_bin) ? left_id : right_id;
     }
+
+    // Single write to global memory
+    // Use atomicAdd only if we are accumulating into an existing buffer (e.g. base_prediction)
+    // But typical usage is out[i] initialized to base.
+    atomicAdd(&out[i], learning_rate * sum);
 }
 
 
@@ -57,9 +65,9 @@ void predict_with_forest(
     int64_t T = tree_tensor.size(0);
     int64_t max_nodes = tree_tensor.size(1);
 
-    int64_t total_jobs = N * T;
+    // Launch configuration based on N (samples), not N*T
     int threads_per_block = 256;
-    int64_t blocks = (total_jobs + threads_per_block - 1) / threads_per_block;
+    int64_t blocks = (N + threads_per_block - 1) / threads_per_block;
 
     predict_forest_kernel<<<blocks, threads_per_block>>>(
         bin_indices.data_ptr<int8_t>(),

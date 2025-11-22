@@ -1,16 +1,19 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cstdint>
 #include <vector>
+#include <algorithm>
 
-// Declare the function from histogram_kernel.cu
-
+// Forward declarations
 void launch_directional_split_kernel(
-    const at::Tensor &G, // [E, F, B]
-    const at::Tensor &H, // [E, F, B]
+    const at::Tensor &G, 
+    const at::Tensor &H, 
     float min_split_gain,
     float min_child_samples,
     float eps,
-    at::Tensor &per_era_gain,       // [E, F, B]
-    at::Tensor &per_era_direction,  // [E, F, B]
+    at::Tensor &per_era_gain,       
+    at::Tensor &per_era_direction,  
     int threads = 128);
 
 void launch_histogram_kernel_cuda_configurable(
@@ -31,17 +34,32 @@ void launch_bin_column_kernel(
     at::Tensor bin_indices);
 
 void predict_with_forest(
-    const at::Tensor &bin_indices, // [N x F], int8
-    const at::Tensor &tree_tensor, // [T x max_nodes x 6], float32
+    const at::Tensor &bin_indices, 
+    const at::Tensor &tree_tensor, 
     float learning_rate,
-    at::Tensor &out // [N], float32
+    at::Tensor &out 
 );
 
-// Bindings
+// Updated signature
+std::vector<torch::Tensor> h_des_mc(
+    torch::Tensor bin_indices,   
+    torch::Tensor grads,         
+    torch::Tensor hess,          
+    torch::Tensor idx_mat,       
+    torch::Tensor idx_len,       
+    torch::Tensor feat_idx,      
+    torch::Tensor era_indices,  
+    torch::Tensor active_classes, // <--- NEW argument
+    int num_bins,         
+    int K_tile_hint,
+    int threads_per_block_hint
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("compute_histogram3", &launch_histogram_kernel_cuda_configurable, "Histogram Feature Shared Mem");
     m.def("compute_split", &launch_directional_split_kernel, "Best Split (CUDA)");
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");
     m.def("predict_forest", &predict_with_forest, "CUDA Predictions");
+    m.def("h_des_mc", &h_des_mc, "Multiclass per-node histogram with indirect class access");
 }
